@@ -14,62 +14,6 @@ pub struct AppState {
     player: Mutex<Option<MpvController>>,
 }
 
-#[cfg(windows)]
-static ORIGINAL_SURFACE_WNDPROC: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
-
-#[cfg(windows)]
-unsafe extern "system" fn surface_window_proc(
-    hwnd: windows_sys::Win32::Foundation::HWND,
-    message: u32,
-    wparam: windows_sys::Win32::Foundation::WPARAM,
-    lparam: windows_sys::Win32::Foundation::LPARAM,
-) -> windows_sys::Win32::Foundation::LRESULT {
-    use std::sync::atomic::Ordering;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, DefWindowProcW, HTTRANSPARENT, MA_NOACTIVATE, WM_MOUSEACTIVATE,
-        WM_NCHITTEST, WNDPROC,
-    };
-
-    match message {
-        WM_NCHITTEST => return HTTRANSPARENT as isize,
-        WM_MOUSEACTIVATE => return MA_NOACTIVATE as isize,
-        _ => {}
-    }
-
-    let original = ORIGINAL_SURFACE_WNDPROC.load(Ordering::Relaxed);
-    if original == 0 {
-        return DefWindowProcW(hwnd, message, wparam, lparam);
-    }
-
-    let original_proc: WNDPROC = std::mem::transmute(original);
-    CallWindowProcW(original_proc, hwnd, message, wparam, lparam)
-}
-
-#[cfg(windows)]
-fn install_surface_input_passthrough(
-    surface: windows_sys::Win32::Foundation::HWND,
-) -> Result<(), String> {
-    use std::sync::atomic::Ordering;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWLP_WNDPROC,
-    };
-
-    let passthrough_proc = surface_window_proc as *const () as isize;
-    let current_proc = unsafe { GetWindowLongPtrW(surface, GWLP_WNDPROC) };
-    if current_proc == passthrough_proc {
-        return Ok(());
-    }
-
-    let previous_proc = unsafe { SetWindowLongPtrW(surface, GWLP_WNDPROC, passthrough_proc) };
-    if previous_proc == 0 {
-        return Err("设置 mpv 画面输入穿透失败".to_string());
-    }
-
-    ORIGINAL_SURFACE_WNDPROC.store(previous_proc, Ordering::Relaxed);
-    Ok(())
-}
-
 fn diagnostic_log_path(file_name: &str) -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -381,10 +325,18 @@ fn is_supported_media(path: &Path) -> bool {
 }
 
 #[tauri::command]
-fn mpv_start(window: Window, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+fn mpv_start(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(), String> {
     #[cfg(not(windows))]
     {
-        let _ = (window, app, state);
+        let _ = (window, app, state, x, y, width, height);
         return Err("当前版本仅支持 Windows".to_string());
     }
 
@@ -398,7 +350,7 @@ fn mpv_start(window: Window, app: AppHandle, state: State<'_, AppState>) -> Resu
             return Ok(());
         }
 
-        let surface = create_native_surface(&window)?;
+        let surface = create_native_surface(&window, x, y, width, height)?;
         let Some(mpv_path) = find_resource_file(&app, "mpv.exe") else {
             destroy_native_surface(surface);
             return Err(
@@ -408,7 +360,6 @@ fn mpv_start(window: Window, app: AppHandle, state: State<'_, AppState>) -> Resu
         };
 
         let input_conf = find_resource_file(&app, "portable_config/input.conf");
-        let mpv_log_path = diagnostic_log_path("InfinityLoop-mpv.log");
         let pipe_name = format!(
             r"\\.\pipe\InfinityLoop-mpv-{}-{}",
             std::process::id(),
@@ -428,22 +379,19 @@ fn mpv_start(window: Window, app: AppHandle, state: State<'_, AppState>) -> Resu
             "--no-config",
             "--keep-open=no",
             "--hwdec=auto-safe",
-            "--msg-level=all=info",
+            "--msg-level=all=warn",
             &format!("--input-ipc-server={pipe_name}"),
             &format!("--wid={surface}"),
         ]);
-        command.arg(format!("--log-file={}", mpv_log_path.display()));
-
         write_diagnostic_log(format!(
-            "starting mpv: path={}, surface={}, parent={}, pipe={}, log={}",
+            "starting mpv: path={}, surface={}, parent={}, pipe={}",
             mpv_path.display(),
             surface,
             window
                 .hwnd()
                 .map(|hwnd| hwnd.0 as isize)
                 .unwrap_or_default(),
-            pipe_name,
-            mpv_log_path.display()
+            pipe_name
         ));
 
         if let Some(input_conf) = input_conf {
@@ -572,9 +520,11 @@ fn spawn_mpv_reader(pipe: Arc<Mutex<File>>, app: AppHandle) {
                 continue;
             };
 
-            if message.get("error").is_some()
-                || message.get("event").and_then(Value::as_str) == Some("end-file")
-            {
+            let command_failed = message
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error != "success");
+            if command_failed || message.get("event").and_then(Value::as_str) == Some("end-file") {
                 write_diagnostic_log(format!("mpv IPC event: {message}"));
             }
 
@@ -680,11 +630,16 @@ fn find_resource_file(app: &AppHandle, relative: &str) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn create_native_surface(window: &Window) -> Result<isize, String> {
+fn create_native_surface(
+    window: &Window,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<isize, String> {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-        WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+        CreateWindowExW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
     };
 
     let parent = window
@@ -694,14 +649,14 @@ fn create_native_surface(window: &Window) -> Result<isize, String> {
 
     let surface = unsafe {
         CreateWindowExW(
-            WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            0,
             class_name.as_ptr(),
             null(),
-            WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-            0,
-            0,
-            0,
-            0,
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+            x,
+            y,
+            width.max(1),
+            height.max(1),
             parent.0,
             null_mut(),
             null_mut(),
@@ -713,16 +668,17 @@ fn create_native_surface(window: &Window) -> Result<isize, String> {
         return Err("创建 mpv 原生画面区域失败".to_string());
     }
 
-    if let Err(error) = install_surface_input_passthrough(surface) {
-        unsafe { DestroyWindow(surface) };
-        return Err(error);
-    }
-
     Ok(surface as isize)
 }
 
 #[cfg(not(windows))]
-fn create_native_surface(_window: &Window) -> Result<isize, String> {
+fn create_native_surface(
+    _window: &Window,
+    _x: i32,
+    _y: i32,
+    _width: i32,
+    _height: i32,
+) -> Result<isize, String> {
     Err("当前版本仅支持 Windows".to_string())
 }
 

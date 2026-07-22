@@ -505,6 +505,10 @@ body {
     background: transparent;
 }
 
+.desktop-mode #player-page {
+    background: #050505;
+}
+
 .header {
     position: fixed;
     top: 0;
@@ -592,6 +596,13 @@ body {
     display: none;
 }
 
+.desktop-mode .video-container {
+    overflow: hidden;
+    scroll-snap-type: none;
+    scroll-behavior: auto;
+    background: #050505;
+}
+
 .video-item {
     height: 100vh;
     scroll-snap-align: start;
@@ -627,17 +638,26 @@ body {
     position: absolute;
     inset: 0 0 58px;
     background: #050505;
-    border-radius: 2px;
     overflow: hidden;
 }
 
 .desktop-mode .video-item {
     box-sizing: border-box;
-    padding-bottom: 58px;
+    padding: 0;
+    background: #050505;
+}
+
+.desktop-mode .desktop-video-item {
+    height: 100vh;
+    scroll-snap-align: none;
+}
+
+.desktop-mode .native-video-surface {
+    inset: 64px 0;
 }
 
 .desktop-mode .video-info-trigger {
-    height: calc(100vh - 58px);
+    display: none;
 }
 
 .desktop-mode .video-placeholder {
@@ -734,6 +754,27 @@ body {
     padding: 8px 20px 5px;
     background: transparent;
     z-index: 100;
+}
+
+.desktop-mode .header,
+.desktop-mode .video-info-bar {
+    height: 64px;
+    box-sizing: border-box;
+    background: #080808;
+}
+
+.desktop-mode .video-info-bar {
+    pointer-events: none;
+    z-index: 101;
+    background: transparent;
+}
+
+.desktop-mode .controls {
+    bottom: 0;
+    height: 64px;
+    box-sizing: border-box;
+    padding: 10px 20px;
+    background: #080808;
 }
 
 .time-display {
@@ -1158,6 +1199,10 @@ body {
     bottom: 20px;
     right: 20px;
     z-index: 1000;
+}
+
+.desktop-mode #player-page:not(.hidden) ~ .shortcuts-help {
+    display: none;
 }
 
 .shortcuts-btn {

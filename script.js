@@ -49,6 +49,7 @@ const state = {
     isReshuffling: false, // 是否正在洗牌中
     lastReshuffleTime: 0, // 上次洗牌的时间戳
     boundaryCooldown: 0,  // 边界冷却时间戳
+    lastWheelNavigation: 0,
     folderHandle: null,   // 文件夹句柄
     includeSubfolders: true, // 是否包含子文件夹
     options: {
@@ -105,7 +106,8 @@ const desktopState = {
     hwdec: '',
     tracks: [],
     fullscreen: false,
-    surfaceSyncFrame: 0
+    surfaceSyncFrame: 0,
+    lastProgressPaint: 0
 };
 
 function invokeDesktop(command, args = {}) {
@@ -196,7 +198,10 @@ function handleDesktopProperty(payload) {
     switch (name) {
         case 'time-pos':
             desktopState.currentTime = Number.isFinite(Number(value)) ? Number(value) : 0;
-            updateProgress(desktopPlayer);
+            if (performance.now() - desktopState.lastProgressPaint >= 100) {
+                desktopState.lastProgressPaint = performance.now();
+                updateProgress(desktopPlayer);
+            }
             break;
         case 'duration':
             desktopState.duration = Number.isFinite(Number(value)) ? Number(value) : NaN;
@@ -213,8 +218,6 @@ function handleDesktopProperty(payload) {
                 state.currentIndex = index;
                 updateVideoCount();
                 updatePlaylistHighlight();
-                const target = elements.videoContainer.querySelectorAll('.video-item')[index];
-                target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 scheduleDesktopSurfaceSync();
             }
             break;
@@ -244,10 +247,10 @@ function handleDesktopInput(args) {
 
     switch (args[0]) {
         case 'infinity-loop-wheel-up':
-            if (!handleWheel({ deltaY: -1 })) playPrev();
+            navigateByWheel(-1);
             break;
         case 'infinity-loop-wheel-down':
-            if (!handleWheel({ deltaY: 1 })) playNext();
+            navigateByWheel(1);
             break;
         case 'infinity-loop-prev':
             playPrev();
@@ -312,7 +315,16 @@ async function ensureDesktopPlayer() {
     if (!isDesktopApp) return;
     await setupDesktopBridge();
     if (desktopState.started) return;
-    await invokeDesktop('mpv_start');
+    const bounds = getDesktopSurfaceBounds();
+    if (!bounds?.visible) {
+        throw new Error('播放器画面区域尚未完成布局');
+    }
+    await invokeDesktop('mpv_start', {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height
+    });
     desktopState.started = true;
     desktopState.playlistSignature = '';
 }
@@ -325,29 +337,36 @@ function getPlaylistSignature() {
     return state.playlist.map(getDesktopPath).join('\u0000');
 }
 
+function getDesktopSurfaceBounds() {
+    const surface = elements.videoContainer.querySelector('.native-video-surface');
+    if (!surface) return null;
+
+    const rect = surface.getBoundingClientRect();
+    const scale = window.devicePixelRatio || 1;
+    const visible = rect.width > 2 && rect.height > 2 && rect.bottom > 0 && rect.top < window.innerHeight;
+    return {
+        x: Math.round(rect.left * scale),
+        y: Math.round(rect.top * scale),
+        width: Math.max(1, Math.round(rect.width * scale)),
+        height: Math.max(1, Math.round(rect.height * scale)),
+        visible
+    };
+}
+
 function syncDesktopSurface() {
     if (!isDesktopApp || !desktopState.started) return;
 
-    const item = elements.videoContainer.querySelectorAll('.video-item')[state.currentIndex];
-    const surface = item?.querySelector('.native-video-surface');
-    if (!surface) {
+    const bounds = getDesktopSurfaceBounds();
+    if (!bounds) {
         invokeDesktop('mpv_resize', { x: 0, y: 0, width: 1, height: 1, visible: false }).catch(() => {});
         return;
     }
 
-    const rect = surface.getBoundingClientRect();
-    const visible = rect.width > 2 && rect.height > 2 && rect.bottom > 0 && rect.top < window.innerHeight;
-    const nextRect = [rect.left, rect.top, rect.width, rect.height, visible].map(value => Math.round(Number(value) || 0)).join(',');
+    const nextRect = [bounds.x, bounds.y, bounds.width, bounds.height, bounds.visible].join(',');
     if (nextRect === desktopState.lastSurfaceRect) return;
     desktopState.lastSurfaceRect = nextRect;
 
-    invokeDesktop('mpv_resize', {
-        x: Math.round(rect.left),
-        y: Math.round(rect.top),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
-        visible
-    }).catch(error => console.debug('调整 mpv 画面失败:', error));
+    invokeDesktop('mpv_resize', bounds).catch(error => console.debug('调整 mpv 画面失败:', error));
 }
 
 function scheduleDesktopSurfaceSync() {
@@ -1120,7 +1139,15 @@ function bindEvents() {
     elements.videoContainer.addEventListener('scroll', handleScroll);
 
     // 滚轮事件 - 用于边界洗牌检测
-    elements.videoContainer.addEventListener('wheel', handleWheel, { passive: true });
+    elements.videoContainer.addEventListener('wheel', (event) => {
+        if (!isDesktopApp) {
+            handleWheel(event);
+            return;
+        }
+
+        event.preventDefault();
+        navigateByWheel(event.deltaY);
+    }, { passive: false });
 
     // 键盘快捷键
     document.addEventListener('keydown', handleKeyboard);
@@ -1238,6 +1265,7 @@ function processFiles(files, folderHandle = null) {
 
     state.videos = videoFiles;
     state.playlist = [...videoFiles];
+    state.currentIndex = 0;
 
     // 如果开启随机播放，打乱顺序（每次都会重新打乱）
     if (state.options.shuffle) {
@@ -1247,17 +1275,21 @@ function processFiles(files, folderHandle = null) {
     showLoading(true);
 
     if (isDesktopApp) {
-        ensureDesktopPlayer().then(() => {
-            renderVideos();
-            updateVideoInfoBar();
-            showPlayer();
-            scheduleDesktopSurfaceSync();
-            showLoading(false);
-        }).catch(error => {
-            console.error('启动 Windows 播放内核失败:', error);
-            showLoading(false);
-            showToast(`❌ 播放内核启动失败：${error?.message || error}`);
-        });
+        renderVideos(0);
+        updateVideoInfoBar();
+        showPlayer();
+
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            ensureDesktopPlayer().then(() => {
+                loadVideoAroundIndex(state.currentIndex);
+                scheduleDesktopSurfaceSync();
+                showLoading(false);
+            }).catch(error => {
+                console.error('启动 Windows 播放内核失败:', error);
+                showLoading(false);
+                showToast(`❌ 播放内核启动失败：${error?.message || error}`);
+            });
+        }));
         return;
     }
 
@@ -1273,6 +1305,17 @@ function processFiles(files, folderHandle = null) {
 // 渲染视频（懒加载模式）
 function renderVideos(targetIndex = 0) {
     elements.videoContainer.innerHTML = '';
+
+    const safeIndex = Math.max(0, Math.min(targetIndex, state.playlist.length - 1));
+    if (isDesktopApp) {
+        const videoItem = document.createElement('div');
+        videoItem.className = 'video-item desktop-video-item';
+        createDesktopVideoSurface(videoItem, safeIndex);
+        elements.videoContainer.appendChild(videoItem);
+        renderPlaylist();
+        loadVideoAroundIndex(safeIndex);
+        return;
+    }
 
     // 只创建占位符，不直接创建video元素
     state.playlist.forEach((video, index) => {
@@ -1308,7 +1351,6 @@ function renderVideos(targetIndex = 0) {
     });
 
     renderPlaylist();
-    const safeIndex = Math.max(0, Math.min(targetIndex, state.playlist.length - 1));
     loadVideoAroundIndex(safeIndex);
 }
 
@@ -1319,27 +1361,8 @@ function loadVideoAroundIndex(index) {
     if (isDesktopApp) {
         const previousIndex = state.currentIndex;
         state.currentIndex = index;
-
-        videoItems.forEach((item, itemIndex) => {
-            const nativeSurface = item.querySelector('.native-video-surface');
-            const placeholder = item.querySelector('.video-placeholder');
-
-            if (itemIndex === index) {
-                placeholder?.remove();
-                if (!nativeSurface) {
-                    createDesktopVideoSurface(item, itemIndex);
-                }
-            } else {
-                nativeSurface?.remove();
-                if (!placeholder) {
-                    const nextPlaceholder = document.createElement('div');
-                    nextPlaceholder.className = 'video-placeholder';
-                    nextPlaceholder.innerHTML = `<span class="placeholder-text">视频 ${itemIndex + 1}</span>`;
-                    nextPlaceholder.dataset.index = itemIndex;
-                    item.appendChild(nextPlaceholder);
-                }
-            }
-        });
+        const surface = elements.videoContainer.querySelector('.native-video-surface');
+        if (surface) surface.dataset.index = index;
 
         const signature = getPlaylistSignature();
         if (desktopState.started && signature && desktopState.playlistSignature !== signature) {
@@ -1389,8 +1412,6 @@ function createDesktopVideoSurface(item, index) {
     const surface = document.createElement('div');
     surface.className = 'native-video-surface';
     surface.dataset.index = index;
-    surface.title = '点击播放/暂停';
-    surface.addEventListener('click', togglePlay);
     item.appendChild(surface);
 }
 
@@ -1467,6 +1488,7 @@ function createVideoElement(item, index) {
 // 渲染播放列表
 function renderPlaylist() {
     elements.playlistContent.innerHTML = '';
+    const fragment = document.createDocumentFragment();
 
     state.playlist.forEach((video, index) => {
         const item = document.createElement('div');
@@ -1488,13 +1510,20 @@ function renderPlaylist() {
             elements.playlist.classList.remove('show');
         });
 
-        elements.playlistContent.appendChild(item);
+        fragment.appendChild(item);
     });
+
+    elements.playlistContent.appendChild(fragment);
 }
 
 // 滚动到指定视频
 function scrollToVideo(index) {
     if (index < 0 || index >= state.playlist.length) return;
+
+    if (isDesktopApp) {
+        loadVideoAroundIndex(index);
+        return;
+    }
 
     const videoItems = elements.videoContainer.querySelectorAll('.video-item');
     const targetItem = videoItems[index];
@@ -1508,6 +1537,8 @@ function scrollToVideo(index) {
 
 // 处理滚动
 function handleScroll() {
+    if (isDesktopApp) return;
+
     const container = elements.videoContainer;
     const scrollTop = container.scrollTop;
     const itemHeight = window.innerHeight;
@@ -1531,8 +1562,20 @@ function handleScroll() {
         });
     }
 
-    if (isDesktopApp) {
-        scheduleDesktopSurfaceSync();
+}
+
+function navigateByWheel(deltaY) {
+    if (!deltaY) return;
+
+    const now = Date.now();
+    if (now - state.lastWheelNavigation < 260) return;
+    state.lastWheelNavigation = now;
+
+    if (handleWheel({ deltaY })) return;
+    if (deltaY < 0) {
+        playPrev();
+    } else {
+        playNext();
     }
 }
 
@@ -1545,8 +1588,10 @@ function handleWheel(e) {
 
     const container = elements.videoContainer;
     const scrollTop = container.scrollTop;
-    const atTop = scrollTop <= 0;
-    const atBottom = scrollTop >= container.scrollHeight - container.clientHeight - 1;
+    const atTop = isDesktopApp ? state.currentIndex === 0 : scrollTop <= 0;
+    const atBottom = isDesktopApp
+        ? state.currentIndex === state.playlist.length - 1
+        : scrollTop >= container.scrollHeight - container.clientHeight - 1;
     const deltaY = e.deltaY;
 
     // 在顶部向上滚
@@ -1619,6 +1664,14 @@ async function reshuffleToFirst() {
     // 重新打乱
     shufflePlaylistArray();
 
+    if (isDesktopApp) {
+        renderVideos(0);
+        elements.loading.classList.add('hidden');
+        videoInfoOverlay?.classList.remove('hidden');
+        state.isReshuffling = false;
+        return;
+    }
+
     // 延迟一下
     setTimeout(() => {
         renderVideos();
@@ -1662,6 +1715,14 @@ async function reshuffleToLast() {
     // 重新打乱
     shufflePlaylistArray();
 
+    if (isDesktopApp) {
+        renderVideos(state.playlist.length - 1);
+        elements.loading.classList.add('hidden');
+        videoInfoOverlay?.classList.remove('hidden');
+        state.isReshuffling = false;
+        return;
+    }
+
     // 延迟一下
     setTimeout(() => {
         renderVideos();
@@ -1696,14 +1757,18 @@ function reshuffleAndScrollToLast() {
     // 重新打乱播放列表
     shufflePlaylistArray();
 
-    // 重新渲染占位符
-    renderVideos();
+    const lastIndex = state.playlist.length - 1;
+    renderVideos(isDesktopApp ? lastIndex : state.currentIndex);
+
+    if (isDesktopApp) {
+        state.isReshuffling = false;
+        return;
+    }
 
     // 使用 requestAnimationFrame 确保DOM更新完成
     requestAnimationFrame(() => {
         requestAnimationFrame(() => {
             // 滚动到底部并加载最后一个视频
-            const lastIndex = state.playlist.length - 1;
             elements.videoContainer.scrollTop = elements.videoContainer.scrollHeight;
             loadVideoAroundIndex(lastIndex);
 
@@ -1733,7 +1798,9 @@ function reshuffleAndKeepPosition() {
     state.currentIndex = newIndex >= 0 ? newIndex : 0;
 
     // 重新渲染
-    renderVideos();
+    renderVideos(state.currentIndex);
+
+    if (isDesktopApp) return;
 
     // 滚动到新位置
     setTimeout(() => {
@@ -1764,10 +1831,8 @@ function updateVideoInfoBar() {
 
 // 更新播放列表高亮
 function updatePlaylistHighlight() {
-    const items = elements.playlistContent.querySelectorAll('.playlist-item');
-    items.forEach((item, index) => {
-        item.classList.toggle('active', index === state.currentIndex);
-    });
+    elements.playlistContent.querySelector('.playlist-item.active')?.classList.remove('active');
+    elements.playlistContent.children[state.currentIndex]?.classList.add('active');
 }
 
 // 更新循环状态
@@ -1872,6 +1937,12 @@ function getCurrentVideo() {
 // 跳转到指定视频
 function jumpToVideo(index) {
     if (index < 0 || index >= state.playlist.length) return;
+
+    if (isDesktopApp) {
+        loadVideoAroundIndex(index);
+        if (state.options.autoPlay) desktopPlayer.play().catch(() => {});
+        return;
+    }
 
     const videoItems = elements.videoContainer.querySelectorAll('.video-item');
     const targetItem = videoItems[index];
