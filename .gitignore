@@ -1,0 +1,14 @@
+/node_modules/
+/frontend/
+/src-tauri/target/
+/src-tauri/gen/
+
+*.log
+*.m3u8
+*.pdb
+
+.DS_Store
+Thumbs.db
+/.idea/
+/.vscode/
+

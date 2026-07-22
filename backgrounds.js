@@ -1,0 +1,22 @@
+window.INFINITY_LOOP_BACKGROUNDS = [
+    'BackGroudPics/1.jpg',
+    'BackGroudPics/2.jpg',
+    'BackGroudPics/3.jpg',
+    'BackGroudPics/4.jpg',
+    'BackGroudPics/5.jpg',
+    'BackGroudPics/6.jpg',
+    'BackGroudPics/7.jpg',
+    'BackGroudPics/8.jpg',
+    'BackGroudPics/9.jpg',
+    'BackGroudPics/10.jpg',
+    'BackGroudPics/11.jpg',
+    'BackGroudPics/12.jpg',
+    'BackGroudPics/13.jpg',
+    'BackGroudPics/14.jpg',
+    'BackGroudPics/15.jpg',
+    'BackGroudPics/16.jpg',
+    'BackGroudPics/17.jpg',
+    'BackGroudPics/18.jpg',
+    'BackGroudPics/1.png',
+    'BackGroudPics/2.png'
+];

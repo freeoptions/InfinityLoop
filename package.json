@@ -1,0 +1,13 @@
+{
+  "name": "infinity-loop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "InfinityLoop Windows 本地播放器",
+  "scripts": {
+    "dev": "cargo tauri dev",
+    "build:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.6"
+  }
+}

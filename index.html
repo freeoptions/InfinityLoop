@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InfinityLoop</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- 首页/选择文件夹界面 -->
+    <div id="home-page" class="page">
+        <div class="home-content">
+            <!-- 继续观看按钮 -->
+            <div class="continue-watching hidden" id="continue-watching">
+                <button class="continue-btn" id="continue-btn">
+                    <span class="continue-icon">▶️</span>
+                    <div class="continue-info">
+                        <span class="continue-title">继续观看</span>
+                        <span class="continue-folder" id="continue-folder-name">上次文件夹</span>
+                    </div>
+                </button>
+            </div>
+
+            <div class="upload-area" id="upload-area">
+                <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <p>点击或拖拽文件夹到此处</p>
+            </div>
+
+            <!-- 隐藏的文件输入框（用于不支持 File System Access API 的浏览器） -->
+            <input type="file" id="folder-input" webkitdirectory directory multiple style="display: none;">
+
+            <!-- 选项 -->
+            <div class="options">
+                <label class="option-item">
+                    <input type="checkbox" id="include-subfolders" checked>
+                    <span>包含子文件夹中的视频</span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <!-- 视频播放页面 -->
+    <div id="player-page" class="page hidden">
+        <div class="header">
+            <button class="back-btn" id="back-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <line x1="19" y1="12" x2="5" y2="12"/>
+                    <polyline points="12 19 5 12 12 5"/>
+                </svg>
+                返回
+            </button>
+            <span class="video-count" id="video-count">0 / 0</span>
+        </div>
+
+        <!-- 顶部视频信息栏 -->
+        <div class="video-info-bar" id="video-info-bar">
+            <span class="info-name" id="info-name">视频文件名</span>
+            <span class="info-size" id="info-size">0 MB</span>
+        </div>
+
+        <div class="video-container" id="video-container">
+            <!-- 视频将通过 JS 动态加载 -->
+        </div>
+
+        <div class="controls" id="controls">
+            <button class="play-pause-btn" id="play-pause-btn" title="播放/暂停">⏸️</button>
+            <span class="time-display" id="current-time">0:00</span>
+            <div class="progress-bar-wrapper" id="progress-wrapper">
+                <div class="progress-bar" id="progress-bar"></div>
+            </div>
+            <span class="time-display" id="total-time">0:00</span>
+            <button class="reshuffle-btn" id="reshuffle-btn" title="重新洗牌">🔀 洗牌</button>
+        </div>
+
+        <!-- 播放列表侧边栏 -->
+        <div class="playlist-sidebar hidden" id="playlist">
+            <div class="playlist-header">
+                <h3>播放列表</h3>
+                <button class="close-btn" id="close-playlist">×</button>
+            </div>
+            <div class="playlist-content" id="playlist-content">
+                <!-- 列表项将通过 JS 动态生成 -->
+            </div>
+        </div>
+    </div>
+
+    <!-- 加载提示 -->
+    <div class="loading-overlay hidden" id="loading">
+        <div class="spinner"></div>
+        <p>加载视频中...</p>
+    </div>
+
+    <!-- 快捷键帮助按钮 -->
+    <div class="shortcuts-help" id="shortcuts-help">
+        <button class="shortcuts-btn">⌨️</button>
+        <div class="shortcuts-tooltip">
+            <h3>快捷键</h3>
+            <div class="shortcut-item"><span class="key">空格 / K</span> <span class="desc">播放/暂停</span></div>
+            <div class="shortcut-item"><span class="key">← →</span> <span class="desc">后退/前进 5秒</span></div>
+            <div class="shortcut-item"><span class="key">↑ ↓</span> <span class="desc">上/下一个视频</span></div>
+            <div class="shortcut-item"><span class="key">0-9</span> <span class="desc">跳转到对应百分比</span></div>
+            <div class="shortcut-item"><span class="key">Ctrl + Alt + C</span> <span class="desc">复制文件名</span></div>
+            <div class="shortcut-item"><span class="key">点击视频</span> <span class="desc">播放/暂停</span></div>
+            <div class="shortcut-item"><span class="key">鼠标悬停左上角</span> <span class="desc">显示视频信息</span></div>
+        </div>
+    </div>
+
+    <script src="backgrounds.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

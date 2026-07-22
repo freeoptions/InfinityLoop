@@ -1,0 +1,8 @@
+# 只把现有播放器前端作为 WebView 资源，Rust 工程和构建产物由 Tauri 单独处理。
+src-tauri
+node_modules
+target
+.git
+package.json
+.tauriignore
+package-lock.json
