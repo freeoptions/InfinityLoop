@@ -10,6 +10,11 @@
     <!-- 首页/选择文件夹界面 -->
     <div id="home-page" class="page">
         <div class="home-content">
+            <div class="home-intro">
+                <span class="home-eyebrow">INFINITY LOOP</span>
+                <h1>选择播放空间</h1>
+                <p>从常用文件夹进入，持续播放你的本地媒体。</p>
+            </div>
             <!-- 继续观看按钮 -->
             <div class="continue-watching hidden" id="continue-watching">
                 <button class="continue-btn" id="continue-btn">
@@ -21,18 +26,6 @@
                 </button>
             </div>
 
-            <div class="upload-area" id="upload-area">
-                <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                    <polyline points="17 8 12 3 7 8"/>
-                    <line x1="12" y1="3" x2="12" y2="15"/>
-                </svg>
-                <p>点击或拖拽文件夹到此处</p>
-            </div>
-
-            <!-- 隐藏的文件输入框（用于不支持 File System Access API 的浏览器） -->
-            <input type="file" id="folder-input" webkitdirectory directory multiple style="display: none;">
-
             <!-- 选项 -->
             <div class="options">
                 <label class="option-item">
@@ -40,6 +33,62 @@
                     <span>包含子文件夹中的视频</span>
                 </label>
             </div>
+
+            <section class="directory-settings" aria-label="常用目录设置">
+                <div class="directory-section">
+                    <div class="directory-heading">
+                        <div>
+                            <span class="directory-kicker">快捷入口</span>
+                            <h2>常用视频文件夹</h2>
+                        </div>
+                        <div class="directory-heading-actions">
+                            <button class="directory-action secondary" id="add-video-group" type="button">新建分组</button>
+                            <button class="directory-action" id="add-video-folder" type="button">添加文件夹</button>
+                        </div>
+                    </div>
+                    <div class="directory-list" id="common-video-folders">
+                        <div class="directory-empty">还没有配置常用文件夹</div>
+                    </div>
+                </div>
+
+                <div class="directory-section wallpaper-section">
+                    <div class="directory-heading">
+                        <div>
+                            <span class="directory-kicker">沉浸背景</span>
+                            <h2>壁纸轮播文件夹</h2>
+                        </div>
+                        <button class="directory-action secondary" id="configure-wallpaper-folder" type="button">配置 / 刷新</button>
+                    </div>
+                    <div class="wallpaper-folder-summary" id="wallpaper-folder-summary">
+                        <span class="directory-empty">当前使用内置壁纸</span>
+                    </div>
+                    <div class="wallpaper-interval-row">
+                        <label for="wallpaper-interval">更换间隔</label>
+                        <div class="wallpaper-interval-input">
+                            <input id="wallpaper-interval" type="number" min="5" max="3600" step="1" value="12">
+                            <span>秒</span>
+                        </div>
+                    </div>
+                    <p class="directory-note">自动递归读取子文件夹；已缓存图片清单，启动时不重复扫描。</p>
+                </div>
+
+                <div class="directory-section move-section">
+                    <div class="directory-heading">
+                        <div>
+                            <span class="directory-kicker">文件整理</span>
+                            <h2>移动目标文件夹</h2>
+                        </div>
+                        <div class="directory-heading-actions">
+                            <button class="directory-action secondary" id="add-move-group" type="button">新建分组</button>
+                            <button class="directory-action" id="configure-move-folder" type="button">添加文件夹</button>
+                        </div>
+                    </div>
+                    <div class="directory-list" id="move-folder-summary">
+                        <span class="directory-empty">尚未配置移动目标</span>
+                    </div>
+                    <p class="directory-note">每个分组会生成一个播放器移动按钮；同组有多个路径时，点击按钮后再选择具体文件夹。</p>
+                </div>
+            </section>
         </div>
     </div>
 
@@ -64,6 +113,14 @@
 
         <div class="video-container" id="video-container">
             <!-- 视频将通过 JS 动态加载 -->
+        </div>
+
+        <div class="player-actions" id="player-actions" aria-label="当前视频操作">
+            <button class="player-action player-action-danger" id="delete-current-video" type="button" title="删除当前视频到回收站" aria-label="删除当前视频到回收站">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>
+                <span>删除</span>
+            </button>
+            <div class="move-target-actions" id="move-target-actions" aria-label="移动到目标文件夹"></div>
         </div>
 
         <div class="controls" id="controls">
@@ -92,6 +149,26 @@
     <div class="loading-overlay hidden" id="loading">
         <div class="spinner"></div>
         <p>加载视频中...</p>
+    </div>
+
+    <div class="modal-overlay hidden" id="folder-alias-modal">
+        <div class="modal folder-alias-modal" role="dialog" aria-modal="true" aria-labelledby="folder-alias-title">
+            <div class="modal-header">
+                <h3 id="folder-alias-title">添加常用文件夹</h3>
+                <button class="modal-close" id="folder-alias-close" type="button" aria-label="关闭">×</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-tip" id="folder-alias-path"></p>
+                <label class="modal-label" id="folder-alias-input-label" for="folder-alias-input">文件夹名称</label>
+                <input class="modal-input" id="folder-alias-input" type="text" maxlength="40" placeholder="例如：动漫、课程、收藏">
+                <label class="modal-label hidden" id="folder-alias-group-label" for="folder-alias-group">所属分组</label>
+                <select class="modal-input hidden" id="folder-alias-group"></select>
+                <div class="modal-actions">
+                    <button class="modal-cancel" id="folder-alias-cancel" type="button">取消</button>
+                    <button class="modal-confirm" id="folder-alias-confirm" type="button">保存</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- 快捷键帮助按钮 -->

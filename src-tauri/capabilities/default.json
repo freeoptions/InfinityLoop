@@ -3,5 +3,8 @@
   "identifier": "default",
   "description": "InfinityLoop Windows 桌面权限",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "libmpv:default"
+  ]
 }

@@ -9,5 +9,8 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.9.6"
+  },
+  "dependencies": {
+    "tauri-plugin-libmpv-api": "^0.3.2"
   }
 }

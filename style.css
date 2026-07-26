@@ -12,6 +12,12 @@
     --text-color: #1a1a1a;
     --text-secondary: #666666;
     --border-color: #ddd;
+    --desktop-video-left: 0px;
+    --desktop-video-right: 100%;
+}
+
+html {
+    background: transparent;
 }
 
 body {
@@ -61,6 +67,36 @@ body {
     opacity: 1;
 }
 
+.bg-layer.background-suspended {
+    visibility: hidden;
+}
+
+.desktop-mode.desktop-player-mode .bg-layer {
+    /* 只显示在视频适配后的左右空白区，中间透明区域交给 libmpv 画面。 */
+    opacity: 1;
+    filter: none;
+    transform: none;
+    -webkit-mask-image: linear-gradient(
+        to right,
+        #000 0 var(--desktop-video-left),
+        transparent var(--desktop-video-left) var(--desktop-video-right),
+        #000 var(--desktop-video-right) 100%
+    );
+    mask-image: linear-gradient(
+        to right,
+        #000 0 var(--desktop-video-left),
+        transparent var(--desktop-video-left) var(--desktop-video-right),
+        #000 var(--desktop-video-right) 100%
+    );
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    transition: opacity 2s ease-in-out;
+}
+
+.desktop-mode.desktop-player-mode .bg-layer.fade-out {
+    opacity: 0;
+}
+
 /* 首页 */
 #home-page {
     display: flex;
@@ -70,13 +106,41 @@ body {
 
 .home-content {
     text-align: center;
-    padding: 10px;
-    max-width: 240px;
+    padding: 12px;
+    max-width: 440px;
     width: 100%;
+    max-height: min(90vh, 780px);
+    overflow-y: auto;
     background: rgba(255, 255, 255, 0.7);
     backdrop-filter: blur(10px);
     border-radius: 10px;
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+}
+
+.home-intro {
+    padding: 10px 8px 16px;
+    text-align: left;
+}
+
+.home-eyebrow {
+    display: block;
+    margin-bottom: 5px;
+    color: var(--primary-color);
+    font-size: 0.64rem;
+    font-weight: 800;
+    letter-spacing: 0.16em;
+}
+
+.home-intro h1 {
+    color: var(--text-color);
+    font-size: 1.45rem;
+    letter-spacing: -0.03em;
+}
+
+.home-intro p {
+    margin-top: 5px;
+    color: var(--text-secondary);
+    font-size: 0.76rem;
 }
 
 .home-content .title {
@@ -244,6 +308,329 @@ body {
 
 .option-item span {
     font-size: 0.75rem;
+}
+
+/* 常用目录配置 */
+.directory-settings {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    text-align: left;
+}
+
+.directory-section {
+    padding: 14px;
+    border: 1px solid rgba(120, 120, 130, 0.18);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.58);
+}
+
+.directory-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.directory-heading-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
+.directory-kicker {
+    display: block;
+    margin-bottom: 3px;
+    color: var(--primary-color);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.directory-heading h2 {
+    color: var(--text-color);
+    font-size: 0.95rem;
+    font-weight: 650;
+}
+
+.directory-action,
+.modal-cancel {
+    flex: 0 0 auto;
+    padding: 7px 12px;
+    border: 1px solid rgba(99, 102, 241, 0.28);
+    border-radius: 8px;
+    background: rgba(99, 102, 241, 0.1);
+    color: var(--primary-color);
+    cursor: pointer;
+    font-size: 0.78rem;
+    transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.directory-action:hover,
+.modal-cancel:hover {
+    border-color: var(--primary-color);
+    background: rgba(99, 102, 241, 0.18);
+}
+
+.directory-action.secondary {
+    color: #475569;
+    border-color: rgba(71, 85, 105, 0.22);
+    background: rgba(71, 85, 105, 0.08);
+}
+
+.directory-list {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    max-height: 330px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+
+.directory-group {
+    overflow: hidden;
+    border: 1px solid rgba(99, 102, 241, 0.18);
+    border-radius: 11px;
+    background: rgba(255, 255, 255, 0.42);
+}
+
+.directory-group-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 35px;
+    padding: 7px 9px;
+    background: rgba(99, 102, 241, 0.07);
+    cursor: pointer;
+    user-select: none;
+}
+
+.directory-group-title {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 6px;
+    color: var(--text-color);
+    font-size: 0.78rem;
+    font-weight: 700;
+}
+
+.directory-group-toggle {
+    display: inline-flex;
+    width: 18px;
+    height: 18px;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--primary-color);
+    cursor: pointer;
+}
+
+.directory-group-toggle:hover {
+    background: rgba(99, 102, 241, 0.14);
+}
+
+.directory-group-chevron {
+    display: inline-block;
+    font-size: 0.88rem;
+    line-height: 1;
+    transition: transform 0.18s ease;
+}
+
+.directory-group.is-collapsed .directory-group-chevron {
+    transform: rotate(-90deg);
+}
+
+.directory-group-title > span:not(.directory-group-icon) {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.directory-group-title small {
+    flex: 0 0 auto;
+    color: var(--text-secondary);
+    font-size: 0.64rem;
+    font-weight: 500;
+}
+
+.directory-group-icon {
+    color: var(--primary-color);
+    font-size: 0.9rem;
+}
+
+.directory-group .directory-group-actions {
+    opacity: 1;
+}
+
+.directory-group.is-collapsed .directory-group-folders {
+    display: none;
+}
+
+.directory-group-folders {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 6px;
+}
+
+.directory-group-folders .directory-item {
+    padding: 7px 8px;
+    border-color: rgba(120, 120, 130, 0.11);
+    background: rgba(255, 255, 255, 0.72);
+}
+
+.directory-group-folders .directory-empty {
+    padding: 5px 4px;
+}
+
+.directory-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    padding: 9px 10px;
+    border: 1px solid rgba(120, 120, 130, 0.14);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.7);
+    cursor: pointer;
+    transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+
+.directory-item:hover {
+    transform: translateY(-1px);
+    border-color: rgba(99, 102, 241, 0.45);
+    background: #fff;
+}
+
+.directory-item-main {
+    flex: 1;
+    min-width: 0;
+}
+
+.directory-item-name,
+.directory-item-path {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.directory-item-name {
+    color: var(--text-color);
+    font-size: 0.84rem;
+    font-weight: 600;
+}
+
+.directory-item-path {
+    margin-top: 2px;
+    color: var(--text-secondary);
+    font-size: 0.66rem;
+}
+
+.directory-item-actions {
+    display: flex;
+    gap: 4px;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+
+.directory-item:hover .directory-item-actions,
+.directory-item:focus-within .directory-item-actions {
+    opacity: 1;
+}
+
+.directory-item-action {
+    padding: 4px 6px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.68rem;
+}
+
+.directory-item-action:hover {
+    background: rgba(99, 102, 241, 0.1);
+    color: var(--primary-color);
+}
+
+.directory-item-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.25;
+}
+
+.directory-item-action.remove:hover {
+    background: rgba(239, 68, 68, 0.1);
+    color: #dc2626;
+}
+
+.directory-empty,
+.directory-note {
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    line-height: 1.5;
+}
+
+.wallpaper-folder-summary {
+    min-width: 0;
+    padding: 9px 10px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.7);
+}
+
+.wallpaper-folder-summary .directory-item-name,
+.wallpaper-folder-summary .directory-item-path {
+    display: block;
+}
+
+.directory-note {
+    margin-top: 7px;
+}
+
+.wallpaper-interval-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.54);
+    color: var(--text-secondary);
+    font-size: 0.73rem;
+}
+
+.wallpaper-interval-input {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--text-color);
+}
+
+.wallpaper-interval-input input {
+    width: 62px;
+    padding: 5px 6px;
+    border: 1px solid rgba(99, 102, 241, 0.25);
+    border-radius: 7px;
+    outline: none;
+    background: rgba(255, 255, 255, 0.85);
+    color: var(--text-color);
+    font: inherit;
+    text-align: right;
+}
+
+.wallpaper-interval-input input:focus {
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
 }
 
 /* 快捷路径 */
@@ -505,8 +892,57 @@ body {
     background: transparent;
 }
 
+.modal-label {
+    display: block;
+    margin-bottom: 7px;
+    color: var(--text-color);
+    font-size: 0.8rem;
+    font-weight: 600;
+}
+
+.folder-alias-modal {
+    max-width: 440px;
+}
+
+.folder-alias-modal .modal-tip {
+    overflow: hidden;
+    padding: 9px 10px;
+    border-radius: 8px;
+    background: rgba(99, 102, 241, 0.08);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.modal-actions .modal-confirm,
+.modal-actions .modal-cancel {
+    width: auto;
+    min-width: 76px;
+}
+
 .desktop-mode #player-page {
-    background: #050505;
+    background: transparent;
+}
+
+.desktop-mode.desktop-player-mode,
+.desktop-mode.desktop-player-mode #player-page,
+.desktop-mode.desktop-player-mode .video-container,
+.desktop-mode.desktop-player-mode .video-item,
+.desktop-mode.desktop-player-mode .desktop-video-item {
+    background: transparent;
+}
+
+.desktop-mode .page {
+    transition: none;
+}
+
+body.desktop-mode:not(.desktop-player-mode) {
+    background: var(--bg-color);
 }
 
 .header {
@@ -600,7 +1036,7 @@ body {
     overflow: hidden;
     scroll-snap-type: none;
     scroll-behavior: auto;
-    background: #050505;
+    background: transparent;
 }
 
 .video-item {
@@ -644,7 +1080,7 @@ body {
 .desktop-mode .video-item {
     box-sizing: border-box;
     padding: 0;
-    background: #050505;
+    background: transparent;
 }
 
 .desktop-mode .desktop-video-item {
@@ -654,6 +1090,8 @@ body {
 
 .desktop-mode .native-video-surface {
     inset: 64px 0;
+    background: transparent;
+    z-index: 1;
 }
 
 .desktop-mode .video-info-trigger {
@@ -756,11 +1194,145 @@ body {
     z-index: 100;
 }
 
+.player-actions {
+    position: fixed;
+    top: 50%;
+    right: 18px;
+    z-index: 120;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transform: translateY(-50%);
+}
+
+.move-target-actions {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.player-action {
+    display: inline-flex;
+    width: 48px;
+    min-height: 50px;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 7px 4px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 12px;
+    background: rgba(10, 12, 18, 0.68);
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18);
+    backdrop-filter: blur(12px);
+    color: rgba(255, 255, 255, 0.88);
+    cursor: pointer;
+    font-size: 0.64rem;
+    transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+
+.player-action svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.7;
+}
+
+.player-action:hover {
+    border-color: rgba(255, 255, 255, 0.42);
+    background: rgba(25, 29, 42, 0.88);
+    transform: translateX(-2px);
+}
+
+.player-action:active {
+    transform: translateX(-2px) scale(0.96);
+}
+
+.player-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.42;
+    transform: none;
+}
+
+.player-action-danger:hover {
+    border-color: rgba(248, 113, 113, 0.65);
+    background: rgba(127, 29, 29, 0.78);
+    color: #fecaca;
+}
+
+.move-target-menu {
+    position: absolute;
+    right: 58px;
+    z-index: 140;
+    width: 220px;
+    padding: 7px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 12px;
+    background: rgba(16, 19, 29, 0.94);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
+    backdrop-filter: blur(16px);
+}
+
+.move-target-menu-title {
+    overflow: hidden;
+    padding: 4px 7px 6px;
+    color: rgba(255, 255, 255, 0.58);
+    font-size: 0.65rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.move-target-menu-item {
+    display: flex;
+    width: 100%;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 7px 8px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: rgba(255, 255, 255, 0.9);
+    cursor: pointer;
+    text-align: left;
+}
+
+.move-target-menu-item:hover {
+    background: rgba(99, 102, 241, 0.28);
+}
+
+.move-target-menu-name,
+.move-target-menu-path {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.move-target-menu-name {
+    font-size: 0.74rem;
+    font-weight: 650;
+}
+
+.move-target-menu-path {
+    color: rgba(255, 255, 255, 0.52);
+    font-size: 0.61rem;
+}
+
+.desktop-mode .player-actions {
+    top: calc(50% + 6px);
+}
+
 .desktop-mode .header,
 .desktop-mode .video-info-bar {
     height: 64px;
     box-sizing: border-box;
-    background: #080808;
+    /* 控件覆盖在视频上方，不能用不透明黑底截掉视频顶部。 */
+    background: rgba(8, 8, 8, 0.72);
 }
 
 .desktop-mode .video-info-bar {
@@ -774,7 +1346,8 @@ body {
     height: 64px;
     box-sizing: border-box;
     padding: 10px 20px;
-    background: #080808;
+    /* 保留视频完整画面，仅用半透明底提升控件可读性。 */
+    background: rgba(8, 8, 8, 0.78);
 }
 
 .time-display {
@@ -1199,6 +1772,18 @@ body {
     bottom: 20px;
     right: 20px;
     z-index: 1000;
+}
+
+@media (max-width: 560px) {
+    .player-actions {
+        right: 8px;
+    }
+
+    .player-action {
+        width: 42px;
+        min-height: 44px;
+        border-radius: 10px;
+    }
 }
 
 .desktop-mode #player-page:not(.hidden) ~ .shortcuts-help {

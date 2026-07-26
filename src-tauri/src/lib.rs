@@ -1,17 +1,68 @@
 use serde::Serialize;
-use serde_json::{json, Value};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, State, Window};
+use std::time::UNIX_EPOCH;
+use tauri::{AppHandle, Emitter, Manager, Window};
 
-#[derive(Default)]
+/*
 pub struct AppState {
     player: Mutex<Option<MpvController>>,
+}
+
+#[cfg(windows)]
+static ORIGINAL_SURFACE_WNDPROC: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+#[cfg(windows)]
+unsafe extern "system" fn surface_window_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, DefWindowProcW, HTTRANSPARENT, MA_NOACTIVATE, WM_MOUSEACTIVATE,
+        WM_NCHITTEST, WNDPROC,
+    };
+
+    match message {
+        WM_NCHITTEST => return HTTRANSPARENT as isize,
+        WM_MOUSEACTIVATE => return MA_NOACTIVATE as isize,
+        _ => {}
+    }
+
+    let original = ORIGINAL_SURFACE_WNDPROC.load(Ordering::Relaxed);
+    if original == 0 {
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    let original_proc: WNDPROC = std::mem::transmute(original);
+    CallWindowProcW(original_proc, hwnd, message, wparam, lparam)
+}
+
+#[cfg(windows)]
+fn install_surface_input_passthrough(
+    surface: windows_sys::Win32::Foundation::HWND,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWLP_WNDPROC,
+    };
+
+    let passthrough_proc = surface_window_proc as *const () as isize;
+    let current_proc = unsafe { GetWindowLongPtrW(surface, GWLP_WNDPROC) };
+    if current_proc == passthrough_proc {
+        return Ok(());
+    }
+
+    let previous_proc = unsafe { SetWindowLongPtrW(surface, GWLP_WNDPROC, passthrough_proc) };
+    if previous_proc == 0 {
+        return Err("设置播放器画面输入穿透失败".to_string());
+    }
+
+    ORIGINAL_SURFACE_WNDPROC.store(previous_proc, Ordering::Relaxed);
+    Ok(())
 }
 
 fn diagnostic_log_path(file_name: &str) -> PathBuf {
@@ -44,6 +95,17 @@ pub struct MediaFile {
     pub last_modified: u64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageFile {
+    pub path: String,
+    pub name: String,
+    #[serde(rename = "webkitRelativePath")]
+    pub webkit_relative_path: String,
+    pub size: u64,
+    pub last_modified: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScanProgress {
@@ -56,23 +118,26 @@ struct ScanProgress {
 
 struct MpvController {
     child: Child,
-    pipe: Arc<Mutex<File>>,
+    command_tx: SyncSender<Vec<u8>>,
     surface: isize,
-    playlist_file: PathBuf,
 }
 
 impl MpvController {
     fn send(&self, command: Vec<Value>) -> Result<(), String> {
+        if command.first().and_then(Value::as_str) == Some("loadfile") {
+            if let Some(path) = command.get(1).and_then(Value::as_str) {
+                write_diagnostic_log(format!("load file: {path}"));
+            }
+        }
         let payload = serde_json::to_vec(&json!({ "command": command }))
             .map_err(|error| format!("序列化 mpv 命令失败：{error}"))?;
-        let mut pipe = self
-            .pipe
-            .lock()
-            .map_err(|_| "mpv 通信管道已损坏".to_string())?;
-        pipe.write_all(&payload)
-            .and_then(|_| pipe.write_all(b"\n"))
-            .and_then(|_| pipe.flush())
-            .map_err(|error| format!("发送 mpv 命令失败：{error}"))
+        let mut queued_payload = payload;
+        queued_payload.push(b'\n');
+        match self.command_tx.try_send(queued_payload) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err("mpv 命令队列已满，请稍后再试".to_string()),
+            Err(TrySendError::Disconnected(_)) => Err("mpv 通信线程已退出".to_string()),
+        }
     }
 
     fn observe_default_properties(&self) -> Result<(), String> {
@@ -80,7 +145,6 @@ impl MpvController {
             "time-pos",
             "duration",
             "pause",
-            "playlist-pos",
             "filename",
             "video-codec",
             "video-format",
@@ -98,47 +162,12 @@ impl MpvController {
         Ok(())
     }
 
-    fn load_playlist(&self, paths: &[String], index: usize) -> Result<(), String> {
-        if paths.is_empty() {
-            return Err("播放列表为空".to_string());
-        }
-
-        let playlist_content = format!(
-            "#EXTM3U\n{}\n",
-            paths
-                .iter()
-                .map(|path| path.replace('\r', "").replace('\n', ""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        fs::write(&self.playlist_file, playlist_content)
-            .map_err(|error| format!("写入 mpv 播放列表失败：{error}"))?;
-        write_diagnostic_log(format!(
-            "load playlist: entries={}, index={}, file={}",
-            paths.len(),
-            index,
-            self.playlist_file.display()
-        ));
-
-        self.send(vec![
-            json!("loadlist"),
-            json!(self.playlist_file.to_string_lossy().into_owned()),
-            json!("replace"),
-        ])?;
-
-        self.send(vec![
-            json!("playlist-play-index"),
-            json!(index.min(paths.len() - 1)),
-        ])
-    }
-
     fn shutdown(&mut self) {
         write_diagnostic_log(format!("stopping mpv: pid={}", self.child.id()));
         let _ = self.send(vec![json!("quit")]);
         thread::sleep(Duration::from_millis(80));
         let _ = self.child.kill();
         destroy_native_surface(self.surface);
-        let _ = fs::remove_file(&self.playlist_file);
     }
 }
 
@@ -146,6 +175,40 @@ impl Drop for MpvController {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+*/
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaFile {
+    pub path: String,
+    pub name: String,
+    #[serde(rename = "webkitRelativePath")]
+    pub webkit_relative_path: String,
+    pub size: u64,
+    pub last_modified: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageFile {
+    pub path: String,
+    pub name: String,
+    #[serde(rename = "webkitRelativePath")]
+    pub webkit_relative_path: String,
+    pub size: u64,
+    pub last_modified: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanProgress {
+    phase: String,
+    scanned: usize,
+    candidates: usize,
+    current_path: String,
+    finished: bool,
 }
 
 #[tauri::command]
@@ -162,6 +225,144 @@ fn pick_folder() -> Result<Option<String>, String> {
     {
         Err("当前版本仅支持 Windows".to_string())
     }
+}
+
+#[tauri::command]
+fn pick_wallpaper_folder() -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        return Ok(rfd::FileDialog::new()
+            .set_title("选择壁纸文件夹")
+            .pick_folder()
+            .map(|path| path.to_string_lossy().into_owned()));
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("当前版本仅支持 Windows".to_string())
+    }
+}
+
+#[tauri::command]
+fn pick_move_folder() -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        return Ok(rfd::FileDialog::new()
+            .set_title("选择移动目标文件夹")
+            .pick_folder()
+            .map(|path| path.to_string_lossy().into_owned()));
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("当前版本仅支持 Windows".to_string())
+    }
+}
+
+#[tauri::command]
+fn send_to_recycle_bin(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsStr;
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::{
+            SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FO_DELETE,
+            SHFILEOPSTRUCTW,
+        };
+
+        let source = PathBuf::from(&path);
+        if !source.is_file() {
+            return Err("当前视频文件不存在或不是文件".to_string());
+        }
+
+        let mut wide_path: Vec<u16> = OsStr::new(&source)
+            .encode_wide()
+            .chain(once(0))
+            .chain(once(0))
+            .collect();
+        let mut operation = SHFILEOPSTRUCTW {
+            hwnd: std::ptr::null_mut(),
+            wFunc: FO_DELETE,
+            pFrom: wide_path.as_mut_ptr(),
+            pTo: std::ptr::null_mut(),
+            fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT) as u16,
+            fAnyOperationsAborted: 0,
+            hNameMappings: std::ptr::null_mut(),
+            lpszProgressTitle: std::ptr::null(),
+        };
+
+        let result = unsafe { SHFileOperationW(&mut operation) };
+        if result != 0 {
+            return Err(format!("移动到回收站失败，系统错误码：{result}"));
+        }
+        if operation.fAnyOperationsAborted != 0 {
+            return Err("移动到回收站操作被取消".to_string());
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("当前版本仅支持 Windows".to_string())
+    }
+}
+
+#[tauri::command]
+fn move_file_to_folder(path: String, destination_dir: String) -> Result<String, String> {
+    let source = PathBuf::from(&path);
+    let destination = PathBuf::from(&destination_dir);
+    if !source.is_file() {
+        return Err("当前视频文件不存在或不是文件".to_string());
+    }
+    if !destination.is_dir() {
+        return Err("移动目标文件夹不存在".to_string());
+    }
+
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| "无法读取当前视频文件名".to_string())?;
+    let target = unique_destination_path(&destination, file_name);
+    if source == target {
+        return Err("移动目标文件夹与当前文件夹相同".to_string());
+    }
+
+    if let Err(rename_error) = fs::rename(&source, &target) {
+        fs::copy(&source, &target).map_err(|copy_error| {
+            format!("移动文件失败：{rename_error}；跨磁盘复制也失败：{copy_error}")
+        })?;
+        fs::remove_file(&source).map_err(|remove_error| {
+            format!("文件已复制到目标文件夹，但原文件删除失败：{remove_error}")
+        })?;
+    }
+
+    Ok(target.to_string_lossy().into_owned())
+}
+
+fn unique_destination_path(directory: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    let original = PathBuf::from(file_name);
+    let stem = original
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("视频");
+    let extension = original.extension().and_then(|value| value.to_str());
+
+    for index in 0..10000 {
+        let candidate_name = if index == 0 {
+            file_name.to_os_string()
+        } else if let Some(extension) = extension {
+            std::ffi::OsString::from(format!("{stem} ({index}).{extension}"))
+        } else {
+            std::ffi::OsString::from(format!("{stem} ({index})"))
+        };
+        let candidate = directory.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    directory.join(file_name)
 }
 
 #[tauri::command]
@@ -204,6 +405,117 @@ fn scan_folder(
     );
 
     Ok(files)
+}
+
+#[tauri::command]
+fn scan_wallpaper_folder(
+    app: AppHandle,
+    path: String,
+    include_subfolders: bool,
+) -> Result<Vec<ImageFile>, String> {
+    let root = PathBuf::from(&path);
+    if !root.is_dir() {
+        return Err("所选壁纸路径不是有效文件夹".to_string());
+    }
+
+    let mut files = Vec::new();
+    let mut scanned = 0usize;
+    scan_image_directory(
+        &app,
+        &root,
+        &root,
+        include_subfolders,
+        &mut scanned,
+        &mut files,
+    )?;
+
+    files.sort_by(|left, right| {
+        left.webkit_relative_path
+            .to_lowercase()
+            .cmp(&right.webkit_relative_path.to_lowercase())
+    });
+
+    Ok(files)
+}
+
+fn scan_image_directory(
+    app: &AppHandle,
+    root: &Path,
+    current: &Path,
+    include_subfolders: bool,
+    scanned: &mut usize,
+    files: &mut Vec<ImageFile>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(current)
+        .map_err(|error| format!("读取壁纸文件夹失败：{} ({error})", current.display()))?;
+
+    for entry in entries.flatten() {
+        *scanned += 1;
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            if include_subfolders {
+                scan_image_directory(app, root, &path, include_subfolders, scanned, files)?;
+            }
+        } else if file_type.is_file() && is_supported_image(&path) {
+            let metadata = entry.metadata().ok();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string();
+
+            files.push(ImageFile {
+                path: path.to_string_lossy().into_owned(),
+                name,
+                webkit_relative_path: relative,
+                size: metadata.as_ref().map(|value| value.len()).unwrap_or(0),
+                last_modified: metadata
+                    .and_then(|value| value.modified().ok())
+                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                    .map(|value| value.as_secs())
+                    .unwrap_or(0),
+            });
+        }
+
+        if *scanned == 1 || *scanned % 50 == 0 {
+            let _ = app.emit(
+                "wallpaper-scan-progress",
+                ScanProgress {
+                    phase: "扫描壁纸".to_string(),
+                    scanned: *scanned,
+                    candidates: files.len(),
+                    current_path: path.to_string_lossy().into_owned(),
+                    finished: false,
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn is_supported_image(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "avif"
+    )
 }
 
 fn scan_directory(
@@ -324,6 +636,7 @@ fn is_supported_media(path: &Path) -> bool {
     )
 }
 
+/*
 #[tauri::command]
 fn mpv_start(
     window: Window,
@@ -411,43 +724,32 @@ fn mpv_start(
         write_diagnostic_log(format!("mpv spawned: pid={}", child.id()));
 
         let pipe = match open_named_pipe(&pipe_name, &mut child) {
-            Ok(file) => Arc::new(Mutex::new(file)),
+            Ok(file) => file,
             Err(error) => {
                 let _ = child.kill();
                 destroy_native_surface(surface);
                 return Err(error);
             }
         };
+        let reader_pipe = pipe.try_clone().map_err(|error| {
+            let _ = child.kill();
+            destroy_native_surface(surface);
+            format!("复制 mpv 通信管道失败：{error}")
+        })?;
+        let command_tx = spawn_mpv_writer(pipe);
 
         let controller = MpvController {
             child,
-            pipe: pipe.clone(),
+            command_tx,
             surface,
-            playlist_file: diagnostic_log_path("InfinityLoop-playlist.m3u8"),
         };
 
         controller.observe_default_properties()?;
         write_diagnostic_log("mpv IPC connected and properties subscribed");
-        spawn_mpv_reader(pipe, app);
+        spawn_mpv_reader(reader_pipe, app);
         *player_slot = Some(controller);
         Ok(())
     }
-}
-
-#[tauri::command]
-fn mpv_load_playlist(
-    paths: Vec<String>,
-    index: usize,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    let player_slot = state
-        .player
-        .lock()
-        .map_err(|_| "播放器状态不可用".to_string())?;
-    let player = player_slot
-        .as_ref()
-        .ok_or_else(|| "mpv 尚未启动".to_string())?;
-    player.load_playlist(&paths, index)
 }
 
 #[tauri::command]
@@ -491,6 +793,8 @@ fn mpv_stop(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+*/
+
 #[tauri::command]
 fn set_fullscreen(window: Window, fullscreen: bool) -> Result<(), String> {
     window
@@ -498,19 +802,33 @@ fn set_fullscreen(window: Window, fullscreen: bool) -> Result<(), String> {
         .map_err(|error| format!("切换全屏失败：{error}"))
 }
 
-fn spawn_mpv_reader(pipe: Arc<Mutex<File>>, app: AppHandle) {
+#[tauri::command]
+fn get_mpv_log_path() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|error| format!("获取程序路径失败：{error}"))?;
+    let parent = exe.parent().ok_or_else(|| "获取程序目录失败".to_string())?;
+    Ok(parent
+        .join("InfinityLoop-mpv.log")
+        .to_string_lossy()
+        .into_owned())
+}
+
+/*
+fn spawn_mpv_writer(mut pipe: File) -> SyncSender<Vec<u8>> {
+    let (command_tx, command_rx) = sync_channel::<Vec<u8>>(64);
+    thread::spawn(move || {
+        for payload in command_rx {
+            if pipe.write_all(&payload).and_then(|_| pipe.flush()).is_err() {
+                break;
+            }
+        }
+    });
+    command_tx
+}
+
+fn spawn_mpv_reader(reader_file: File, app: AppHandle) {
     thread::spawn(move || {
         write_diagnostic_log("mpv reader thread started");
-        let Ok(reader_file) = pipe
-            .lock()
-            .ok()
-            .and_then(|file| file.try_clone().ok())
-            .ok_or(())
-        else {
-            write_diagnostic_log("mpv reader could not clone IPC pipe");
-            return;
-        };
-
+        let mut last_time_pos_emit = Instant::now() - Duration::from_secs(1);
         let reader = BufReader::new(reader_file);
         for line in reader.lines().flatten() {
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
@@ -529,6 +847,15 @@ fn spawn_mpv_reader(pipe: Arc<Mutex<File>>, app: AppHandle) {
             }
 
             if message.get("event").and_then(Value::as_str) == Some("property-change") {
+                let property_name = message.get("name").and_then(Value::as_str);
+                if property_name == Some("time-pos") {
+                    let now = Instant::now();
+                    if now.duration_since(last_time_pos_emit) < Duration::from_millis(120) {
+                        continue;
+                    }
+                    last_time_pos_emit = now;
+                }
+
                 let _ = app.emit(
                     "mpv-property",
                     json!({
@@ -639,7 +966,8 @@ fn create_native_surface(
 ) -> Result<isize, String> {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+        CreateWindowExW, DestroyWindow, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+        WS_EX_NOACTIVATE, WS_VISIBLE,
     };
 
     let parent = window
@@ -649,7 +977,7 @@ fn create_native_surface(
 
     let surface = unsafe {
         CreateWindowExW(
-            0,
+            WS_EX_NOACTIVATE,
             class_name.as_ptr(),
             null(),
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
@@ -666,6 +994,11 @@ fn create_native_surface(
 
     if surface.is_null() {
         return Err("创建 mpv 原生画面区域失败".to_string());
+    }
+
+    if let Err(error) = install_surface_input_passthrough(surface) {
+        unsafe { DestroyWindow(surface) };
+        return Err(error);
     }
 
     Ok(surface as isize)
@@ -737,11 +1070,24 @@ fn destroy_native_surface(surface: isize) {
 
 #[cfg(not(windows))]
 fn destroy_native_surface(_surface: isize) {}
+*/
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+fn stop_player(app: &AppHandle) {
+    use tauri_plugin_libmpv::MpvExt;
+    let _ = app.mpv().destroy("main");
+}
+
+fn cleanup_tray(app: &AppHandle) {
+    if let Some(tray) = app.remove_tray_by_id("main") {
+        let _ = tray.set_visible(false);
+        let _ = tray.set_icon(None);
     }
 }
 
@@ -759,7 +1105,11 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                stop_player(app);
+                cleanup_tray(app);
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -793,7 +1143,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
 pub fn run() {
     tauri::Builder::default()
-        .manage(AppState::default())
+        .plugin(tauri_plugin_libmpv::init())
         .setup(|app| {
             build_tray(app)?;
             Ok(())
@@ -806,12 +1156,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             pick_folder,
+            pick_wallpaper_folder,
+            pick_move_folder,
             scan_folder,
-            mpv_start,
-            mpv_load_playlist,
-            mpv_command,
-            mpv_resize,
-            mpv_stop,
+            scan_wallpaper_folder,
+            send_to_recycle_bin,
+            move_file_to_folder,
+            get_mpv_log_path,
             set_fullscreen
         ])
         .run(tauri::generate_context!())

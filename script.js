@@ -63,8 +63,6 @@ const state = {
 const elements = {
     homePage: document.getElementById('home-page'),
     playerPage: document.getElementById('player-page'),
-    uploadArea: document.getElementById('upload-area'),
-    folderInput: document.getElementById('folder-input'),
     includeSubfolders: document.getElementById('include-subfolders'),
     videoContainer: document.getElementById('video-container'),
     videoCount: document.getElementById('video-count'),
@@ -86,15 +84,37 @@ const elements = {
     videoInfoBar: document.getElementById('video-info-bar'),
     infoName: document.getElementById('info-name'),
     infoSize: document.getElementById('info-size'),
-    tipText: document.getElementById('tip-text')
+    tipText: document.getElementById('tip-text'),
+    addVideoFolder: document.getElementById('add-video-folder'),
+    addVideoGroup: document.getElementById('add-video-group'),
+    commonVideoFolders: document.getElementById('common-video-folders'),
+    configureWallpaperFolder: document.getElementById('configure-wallpaper-folder'),
+    wallpaperFolderSummary: document.getElementById('wallpaper-folder-summary'),
+    wallpaperInterval: document.getElementById('wallpaper-interval'),
+    configureMoveFolder: document.getElementById('configure-move-folder'),
+    addMoveGroup: document.getElementById('add-move-group'),
+    moveFolderSummary: document.getElementById('move-folder-summary'),
+    deleteCurrentVideo: document.getElementById('delete-current-video'),
+    moveTargetActions: document.getElementById('move-target-actions'),
+    folderAliasModal: document.getElementById('folder-alias-modal'),
+    folderAliasTitle: document.getElementById('folder-alias-title'),
+    folderAliasPath: document.getElementById('folder-alias-path'),
+    folderAliasInputLabel: document.getElementById('folder-alias-input-label'),
+    folderAliasInput: document.getElementById('folder-alias-input'),
+    folderAliasGroupLabel: document.getElementById('folder-alias-group-label'),
+    folderAliasGroup: document.getElementById('folder-alias-group'),
+    folderAliasClose: document.getElementById('folder-alias-close'),
+    folderAliasCancel: document.getElementById('folder-alias-cancel'),
+    folderAliasConfirm: document.getElementById('folder-alias-confirm')
 };
 
 // Tauri 桌面桥接。浏览器模式仍然保留，方便继续预览界面；Windows 版本将播放交给 mpv。
 const isDesktopApp = Boolean(window.__TAURI__?.core?.invoke);
+const MPV_WINDOW_LABEL = 'main';
 const desktopState = {
+    mode: 'idle',
     started: false,
     eventReady: null,
-    playlistSignature: '',
     lastSurfaceRect: '',
     lastError: '',
     currentTime: 0,
@@ -104,10 +124,21 @@ const desktopState = {
     codec: '',
     format: '',
     hwdec: '',
+    videoWidth: 0,
+    videoHeight: 0,
+    videoDisplayWidth: 0,
+    videoDisplayHeight: 0,
+    pendingVideoWidth: 0,
+    pendingVideoHeight: 0,
+    pendingVideoDisplayWidth: 0,
+    pendingVideoDisplayHeight: 0,
     tracks: [],
     fullscreen: false,
     surfaceSyncFrame: 0,
-    lastProgressPaint: 0
+    lastProgressPaint: 0,
+    navigationRequest: 0,
+    endHandled: false,
+    navigationChain: Promise.resolve()
 };
 
 function invokeDesktop(command, args = {}) {
@@ -119,7 +150,22 @@ function invokeDesktop(command, args = {}) {
 
 function sendDesktopCommand(command) {
     if (!desktopState.started) return Promise.resolve();
-    return invokeDesktop('mpv_command', { command }).catch(error => {
+    const [name, ...rawArgs] = command;
+    const args = rawArgs.map(value => {
+        if (value === 'yes') return true;
+        if (value === 'no') return false;
+        if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) {
+            return Number(value);
+        }
+        return value;
+    });
+    const invokeName = name === 'set_property'
+        ? 'plugin:libmpv|set_property'
+        : 'plugin:libmpv|command';
+    const invokeArgs = name === 'set_property'
+        ? { name: args[0], value: args[1], windowLabel: MPV_WINDOW_LABEL }
+        : { name, args, windowLabel: MPV_WINDOW_LABEL };
+    return invokeDesktop(invokeName, invokeArgs).catch(error => {
         console.error('mpv 命令失败:', command, error);
         if (desktopState.lastError !== String(error)) {
             desktopState.lastError = String(error);
@@ -127,6 +173,49 @@ function sendDesktopCommand(command) {
         }
         throw error;
     });
+}
+
+function describeMpvError(error) {
+    const code = Number(error);
+    const descriptions = {
+        [-13]: '文件加载失败',
+        [-16]: '没有找到可播放的音视频流',
+        [-17]: '文件格式无法识别，或文件内容已损坏/不完整',
+        [-18]: '当前系统不满足播放器要求'
+    };
+    return descriptions[code]
+        ? `${descriptions[code]}（错误码 ${code}）`
+        : `播放器错误 ${String(error)}`;
+}
+
+function queueDesktopNavigation(index) {
+    const requestId = ++desktopState.navigationRequest;
+    // 一个文件结束时，end-file 和 eof-reached 可能连续到达；切换到新文件后允许新一轮结束检测。
+    desktopState.endHandled = false;
+    const job = desktopState.navigationChain
+        .catch(() => {})
+        .then(() => {
+            if (requestId !== desktopState.navigationRequest || !desktopState.started) return;
+            const video = state.playlist[index];
+            if (!video?.path) throw new Error('当前媒体缺少文件路径');
+            return desktopPlayer.loadFile(video.path);
+        });
+
+    desktopState.navigationChain = job.catch(() => {});
+    job.catch(error => console.error('mpv 切换失败:', error));
+    return requestId;
+}
+
+function queueDesktopPlay(requestId) {
+    const job = desktopState.navigationChain
+        .catch(() => {})
+        .then(() => {
+            if (requestId !== desktopState.navigationRequest || !desktopState.started) return;
+            return desktopPlayer.play();
+        });
+
+    desktopState.navigationChain = job.catch(() => {});
+    job.catch(error => console.error('mpv 播放失败:', error));
 }
 
 const desktopPlayer = {
@@ -168,26 +257,40 @@ const desktopPlayer = {
         const target = elements.playerPage || document.documentElement;
         return target.requestFullscreen?.() || Promise.resolve();
     },
-    loadIndex(index) {
-        if (!desktopState.started) return Promise.resolve();
-        return sendDesktopCommand(['playlist-play-index', String(index)]);
+    loadFile(path) {
+        if (!desktopState.started || !path) return Promise.resolve();
+        return sendDesktopCommand(['loadfile', path, 'replace']);
     },
-    loadPlaylist() {
-        if (!desktopState.started || state.playlist.length === 0) return Promise.resolve();
-        const paths = state.playlist.map(video => video.path).filter(Boolean);
-        if (paths.length !== state.playlist.length) {
-            return Promise.reject(new Error('桌面播放器缺少文件路径'));
-        }
-        desktopState.playlistSignature = paths.join('\u0000');
-        return invokeDesktop('mpv_load_playlist', {
-            paths,
-            index: state.currentIndex
-        });
-    }
 };
 
 function getTauriPayload(event) {
     return event && Object.prototype.hasOwnProperty.call(event, 'payload') ? event.payload : event;
+}
+
+// 壁纸位于 WebView 上层，而 libmpv 画面位于透明窗口下层；根据视频比例挖出中间透明区域，避免壁纸遮挡视频。
+function updateDesktopVideoMask() {
+    if (!isDesktopApp) return;
+
+    // video-params 是源文件像素尺寸，可能未包含像素宽高比；遮罩必须优先使用
+    // mpv 最终输出到窗口的 display width/height，否则视频和透明挖空区域会错开，
+    // 两侧就会露出透明窗口的黑底。
+    const width = Number(desktopState.videoDisplayWidth || desktopState.videoWidth);
+    const height = Number(desktopState.videoDisplayHeight || desktopState.videoHeight);
+    const viewportWidth = Math.max(1, window.innerWidth);
+    // libmpv 直接渲染到透明主窗口，视频实际占用整块客户区；顶部标题栏和底部控件是覆盖层，不能从遮罩计算中扣除。
+    const viewportHeight = Math.max(1, window.innerHeight);
+
+    if (!(width > 0) || !(height > 0)) {
+        document.documentElement.style.setProperty('--desktop-video-left', '0px');
+        document.documentElement.style.setProperty('--desktop-video-right', '100%');
+        return;
+    }
+
+    const fittedWidth = Math.min(viewportWidth, viewportHeight * (width / height));
+    const left = Math.max(0, Math.round((viewportWidth - fittedWidth) / 2));
+    const right = Math.min(viewportWidth, Math.round(viewportWidth - left));
+    document.documentElement.style.setProperty('--desktop-video-left', `${left}px`);
+    document.documentElement.style.setProperty('--desktop-video-right', `${right}px`);
 }
 
 function handleDesktopProperty(payload) {
@@ -212,18 +315,18 @@ function handleDesktopProperty(payload) {
             state.isPlaying = !desktopState.paused;
             updatePlayPauseButton();
             break;
-        case 'playlist-pos': {
-            const index = Number(value);
-            if (Number.isInteger(index) && index >= 0 && index < state.playlist.length) {
-                state.currentIndex = index;
-                updateVideoCount();
-                updatePlaylistHighlight();
-                scheduleDesktopSurfaceSync();
+        case 'eof-reached':
+            if (Boolean(value)) {
+                scheduleDesktopNext();
             }
             break;
-        }
         case 'filename':
             desktopState.filename = String(value || '');
+            // 切换文件时保留上一帧的遮罩，等待新的宽高都到齐后一次性更新，避免背景闪烁。
+            desktopState.pendingVideoWidth = 0;
+            desktopState.pendingVideoHeight = 0;
+            desktopState.pendingVideoDisplayWidth = 0;
+            desktopState.pendingVideoDisplayHeight = 0;
             break;
         case 'video-codec':
             desktopState.codec = String(value || '');
@@ -237,9 +340,83 @@ function handleDesktopProperty(payload) {
         case 'track-list':
             desktopState.tracks = Array.isArray(value) ? value : [];
             break;
+        case 'video-params/w':
+            desktopState.pendingVideoWidth = Number(value) || 0;
+            if (desktopState.pendingVideoWidth > 0 && desktopState.pendingVideoHeight > 0
+                && !(desktopState.pendingVideoDisplayWidth > 0 && desktopState.pendingVideoDisplayHeight > 0)
+                && !(desktopState.videoDisplayWidth > 0 && desktopState.videoDisplayHeight > 0)) {
+                desktopState.videoWidth = desktopState.pendingVideoWidth;
+                desktopState.videoHeight = desktopState.pendingVideoHeight;
+                updateDesktopVideoMask();
+            }
+            break;
+        case 'video-params/h':
+            desktopState.pendingVideoHeight = Number(value) || 0;
+            if (desktopState.pendingVideoWidth > 0 && desktopState.pendingVideoHeight > 0
+                && !(desktopState.pendingVideoDisplayWidth > 0 && desktopState.pendingVideoDisplayHeight > 0)
+                && !(desktopState.videoDisplayWidth > 0 && desktopState.videoDisplayHeight > 0)) {
+                desktopState.videoWidth = desktopState.pendingVideoWidth;
+                desktopState.videoHeight = desktopState.pendingVideoHeight;
+                updateDesktopVideoMask();
+            }
+            break;
+        case 'video-out-params/dw':
+            desktopState.pendingVideoDisplayWidth = Number(value) || 0;
+            if (desktopState.pendingVideoDisplayWidth > 0 && desktopState.pendingVideoDisplayHeight > 0) {
+                desktopState.videoDisplayWidth = desktopState.pendingVideoDisplayWidth;
+                desktopState.videoDisplayHeight = desktopState.pendingVideoDisplayHeight;
+                updateDesktopVideoMask();
+            }
+            break;
+        case 'video-out-params/dh':
+            desktopState.pendingVideoDisplayHeight = Number(value) || 0;
+            if (desktopState.pendingVideoDisplayWidth > 0 && desktopState.pendingVideoDisplayHeight > 0) {
+                desktopState.videoDisplayWidth = desktopState.pendingVideoDisplayWidth;
+                desktopState.videoDisplayHeight = desktopState.pendingVideoDisplayHeight;
+                updateDesktopVideoMask();
+            }
+            break;
         default:
             break;
     }
+}
+
+function isNaturalDesktopEnd(reason) {
+    // 不同 libmpv/插件版本可能把 EOF 原因传成字符串或 0。
+    return reason === 'eof'
+        || reason === 'eof-reached'
+        || reason === 0
+        || reason === '0';
+}
+
+function scheduleDesktopNext() {
+    if (
+        desktopState.endHandled
+        || desktopState.mode !== 'mpv'
+        || !desktopState.started
+        || !state.options.autoPlay
+        || state.options.loopSingle
+    ) {
+        return;
+    }
+
+    desktopState.endHandled = true;
+    const finishedIndex = state.currentIndex;
+    const requestId = desktopState.navigationRequest;
+    const finishedFilename = desktopState.filename;
+    setTimeout(() => {
+        if (
+            desktopState.mode === 'mpv'
+            && desktopState.started
+            && state.options.autoPlay
+            && !state.options.loopSingle
+            && state.currentIndex === finishedIndex
+            && desktopState.navigationRequest === requestId
+            && (!finishedFilename || !desktopState.filename || desktopState.filename === finishedFilename)
+        ) {
+            playNext();
+        }
+    }, 0);
 }
 
 function handleDesktopInput(args) {
@@ -284,16 +461,38 @@ async function setupDesktopBridge() {
     }
 
     desktopState.eventReady = Promise.all([
-        listen('mpv-property', event => handleDesktopProperty(getTauriPayload(event))),
-        listen('mpv-event', event => {
+        listen(`mpv-event-${MPV_WINDOW_LABEL}`, event => {
             const payload = getTauriPayload(event);
-            if (payload?.event === 'client-message') {
+            if (payload?.event === 'property-change') {
+                handleDesktopProperty({ name: payload.name, value: payload.data });
+            } else if (payload?.event === 'client-message') {
                 handleDesktopInput(payload.args);
             } else if (payload?.event === 'backend-exited' && desktopState.started) {
                 desktopState.started = false;
                 showToast('播放器内核已退出');
+            } else if (
+                payload?.event === 'end-file'
+                && isNaturalDesktopEnd(payload?.reason)
+            ) {
+                scheduleDesktopNext();
             } else if (payload?.event === 'end-file' && payload?.reason === 'error') {
-                showToast(`❌ 当前文件无法播放${payload.error ? `：${payload.error}` : ''}`);
+                const errorDetail = payload.error !== undefined
+                    ? `：${describeMpvError(payload.error)}`
+                    : '';
+                showToast(`❌ 当前文件无法播放${errorDetail}`);
+                if (desktopState.mode === 'mpv' && state.options.autoPlay && !state.options.loopSingle) {
+                    const failedIndex = state.currentIndex;
+                    const requestId = desktopState.navigationRequest;
+                    setTimeout(() => {
+                        if (
+                            desktopState.mode === 'mpv'
+                            && state.currentIndex === failedIndex
+                            && desktopState.navigationRequest === requestId
+                        ) {
+                            playNext();
+                        }
+                    }, 0);
+                }
             }
         }),
         listen('folder-scan-progress', event => {
@@ -315,27 +514,140 @@ async function ensureDesktopPlayer() {
     if (!isDesktopApp) return;
     await setupDesktopBridge();
     if (desktopState.started) return;
-    const bounds = getDesktopSurfaceBounds();
-    if (!bounds?.visible) {
-        throw new Error('播放器画面区域尚未完成布局');
-    }
-    await invokeDesktop('mpv_start', {
-        x: bounds.x,
-        y: bounds.y,
-        width: bounds.width,
-        height: bounds.height
+    const mpvLogPath = await invokeDesktop('get_mpv_log_path')
+        .catch(() => 'InfinityLoop-mpv.log');
+    await invokeDesktop('plugin:libmpv|init', {
+        windowLabel: MPV_WINDOW_LABEL,
+        mpvConfig: {
+            initialOptions: {
+                vo: 'gpu-next',
+                hwdec: 'auto-safe',
+                'keep-open': 'yes',
+                'force-window': 'yes',
+                keepaspect: 'yes',
+                'video-unscaled': 'no',
+                panscan: 0,
+                'video-zoom': 0,
+                'video-pan-x': 0,
+                'video-pan-y': 0,
+                // 保持软件默认听感，不使用音频滤镜，避免不同视频出现爆音或失真。
+                volume: 120,
+                'volume-max': 200,
+                'input-cursor-passthrough': 'yes',
+                'input-vo-keyboard': 'no',
+                'input-default-bindings': 'no',
+                osc: 'no',
+                'osd-level': 0,
+                'log-file': mpvLogPath,
+                'msg-level': 'all=info'
+            },
+            observedProperties: {
+                pause: 'flag',
+                'time-pos': 'double',
+                duration: 'double',
+                'eof-reached': 'flag',
+                filename: 'string',
+                'video-codec': 'string',
+                'video-format': 'string',
+                'hwdec-current': 'string',
+                'video-params/w': 'int64',
+                'video-params/h': 'int64',
+                'video-out-params/dw': 'int64',
+                'video-out-params/dh': 'int64',
+                'track-list': 'node'
+            }
+        }
     });
     desktopState.started = true;
-    desktopState.playlistSignature = '';
 }
 
-function getDesktopPath(video) {
-    return video?.path || '';
+/*
+async function switchDesktopToMpv(index) {
+    if (!isDesktopApp) return;
+    if (desktopState.fallbackPending) {
+        desktopState.pendingIndex = index;
+        return;
+    }
+
+    desktopState.fallbackPending = true;
+    desktopState.mode = 'mpv';
+    desktopState.directFileMode = true;
+    state.currentIndex = index;
+    showLoading(true);
+
+    const item = elements.videoContainer.querySelector('.video-item');
+    if (item) {
+        item.innerHTML = '';
+        createDesktopVideoSurface(item, index);
+    }
+
+    try {
+        await ensureDesktopPlayer();
+        await desktopPlayer.loadFile(state.playlist[index]?.path);
+        scheduleDesktopSurfaceSync();
+        if (state.options.autoPlay) {
+            await desktopPlayer.play();
+        }
+    } catch (error) {
+        console.error('切换兼容播放器失败:', error);
+        showToast(`❌ 当前文件无法播放：${error?.message || error}`);
+    } finally {
+        showLoading(false);
+        const pendingIndex = desktopState.pendingIndex;
+        desktopState.pendingIndex = null;
+        desktopState.fallbackPending = false;
+        if (Number.isInteger(pendingIndex) && pendingIndex !== index) {
+            setTimeout(() => loadVideoAroundIndex(pendingIndex), 0);
+        }
+    }
 }
 
-function getPlaylistSignature() {
-    return state.playlist.map(getDesktopPath).join('\u0000');
+async function switchDesktopToWebView(index) {
+    if (!isDesktopApp) return;
+    if (desktopState.fallbackPending) {
+        desktopState.pendingIndex = index;
+        return;
+    }
+
+    desktopState.fallbackPending = true;
+    desktopState.mode = 'webview';
+    desktopState.directFileMode = false;
+    desktopState.navigationRequest += 1;
+    state.currentIndex = index;
+    showLoading(true);
+
+    try {
+        if (desktopState.started) {
+            desktopState.started = false;
+            desktopState.lastSurfaceRect = '';
+            await invokeDesktop('plugin:libmpv|destroy', { windowLabel: MPV_WINDOW_LABEL })
+                .catch(error => console.debug('销毁 libmpv 播放器失败:', error));
+        }
+
+        const item = elements.videoContainer.querySelector('.video-item');
+        if (item) {
+            item.innerHTML = '';
+            createVideoElement(item, index);
+        }
+        updateVideoCount();
+        updatePlaylistHighlight();
+
+        const currentVideo = getCurrentVideo();
+        if (currentVideo && state.options.autoPlay) {
+            await currentVideo.play().catch(() => {});
+        }
+    } finally {
+        showLoading(false);
+        const pendingIndex = desktopState.pendingIndex;
+        desktopState.pendingIndex = null;
+        desktopState.fallbackPending = false;
+        if (Number.isInteger(pendingIndex) && pendingIndex !== index) {
+            setTimeout(() => loadVideoAroundIndex(pendingIndex), 0);
+        }
+    }
 }
+
+*/
 
 function getDesktopSurfaceBounds() {
     const surface = elements.videoContainer.querySelector('.native-video-surface');
@@ -343,10 +655,15 @@ function getDesktopSurfaceBounds() {
 
     const rect = surface.getBoundingClientRect();
     const scale = window.devicePixelRatio || 1;
-    const visible = rect.width > 2 && rect.height > 2 && rect.bottom > 0 && rect.top < window.innerHeight;
+    const visible = rect.width > 2
+        && rect.height > 2
+        && rect.right > 0
+        && rect.bottom > 0
+        && rect.left < window.innerWidth
+        && rect.top < window.innerHeight;
     return {
-        x: Math.round(rect.left * scale),
-        y: Math.round(rect.top * scale),
+        x: Math.max(0, Math.round(rect.left * scale)),
+        y: Math.max(0, Math.round(rect.top * scale)),
         width: Math.max(1, Math.round(rect.width * scale)),
         height: Math.max(1, Math.round(rect.height * scale)),
         visible
@@ -354,19 +671,7 @@ function getDesktopSurfaceBounds() {
 }
 
 function syncDesktopSurface() {
-    if (!isDesktopApp || !desktopState.started) return;
-
-    const bounds = getDesktopSurfaceBounds();
-    if (!bounds) {
-        invokeDesktop('mpv_resize', { x: 0, y: 0, width: 1, height: 1, visible: false }).catch(() => {});
-        return;
-    }
-
-    const nextRect = [bounds.x, bounds.y, bounds.width, bounds.height, bounds.visible].join(',');
-    if (nextRect === desktopState.lastSurfaceRect) return;
-    desktopState.lastSurfaceRect = nextRect;
-
-    invokeDesktop('mpv_resize', bounds).catch(error => console.debug('调整 mpv 画面失败:', error));
+    // libmpv renders into the transparent main Tauri window directly.
 }
 
 function scheduleDesktopSurfaceSync() {
@@ -383,7 +688,7 @@ let videoInfoOverlay = null;
 
 // IndexedDB 数据库名称
 const DB_NAME = `InfinityLoopDB_${INSTANCE_ID}`;
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'savedPaths';
 const PRESET_STORE_NAME = 'presetPaths';
 
@@ -401,6 +706,33 @@ const DESKTOP_VIDEO_FORMATS = [
     '.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.oga', '.opus',
     '.wma', '.ape', '.tta', '.ac3', '.dts'
 ];
+
+const WEBVIEW_DESKTOP_FORMATS = new Set([
+    '.mp4', '.m4v', '.mov', '.webm', '.ogv',
+    '.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.oga', '.opus', '.wma'
+]);
+
+function getFileExtension(file) {
+    return `.${String(file?.name || file?.path || '').split('.').pop().toLowerCase()}`;
+}
+
+function getDesktopAssetUrl(video) {
+    const convertFileSrc = window.__TAURI__?.core?.convertFileSrc;
+    if (!convertFileSrc || !video?.path) return '';
+
+    try {
+        return convertFileSrc(video.path);
+    } catch (error) {
+        console.warn('本地媒体路径转换失败:', error);
+        return '';
+    }
+}
+
+function canUseDesktopWebView(video) {
+    return isDesktopApp
+        && WEBVIEW_DESKTOP_FORMATS.has(getFileExtension(video))
+        && Boolean(getDesktopAssetUrl(video));
+}
 
 const VIDEO_FORMATS = isDesktopApp ? DESKTOP_VIDEO_FORMATS : [
     '.mp4', '.m4v', '.webm', '.ogg', '.ogv',
@@ -422,14 +754,564 @@ const bgState = {
     currentLayer: 1
 };
 
+const COMMON_VIDEO_FOLDERS_KEY = 'commonVideoFolders';
+const WALLPAPER_FOLDER_KEY = 'wallpaperFolder';
+const WALLPAPER_CACHE_STORE_NAME = 'wallpaperCache';
+const WALLPAPER_INTERVAL_KEY = 'wallpaperIntervalSeconds';
+const MOVE_FOLDER_KEY = 'moveFolder';
+const MOVE_FOLDERS_KEY = 'moveFolders';
+const FOLDER_GROUP_COLLAPSE_KEY = 'folderGroupCollapse';
+const DEFAULT_WALLPAPER_INTERVAL_SECONDS = 12;
+let pendingFolderEditor = null;
+let activeMoveTargetMenu = null;
+
+function readStoredJson(key, fallback) {
+    try {
+        const value = storage.getItem(key);
+        return value ? JSON.parse(value) : fallback;
+    } catch (error) {
+        console.warn('读取本地配置失败:', key, error);
+        return fallback;
+    }
+}
+
+function writeStoredJson(key, value) {
+    storage.setItem(key, JSON.stringify(value));
+}
+
+function createConfigId(prefix) {
+    return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function normalizeFolderGroups(raw, legacyName = '未分组') {
+    if (Array.isArray(raw) && raw.some(item => Array.isArray(item?.folders))) {
+        return raw.map(group => ({
+            id: group.id || createConfigId('group'),
+            name: group.name || legacyName,
+            folders: Array.isArray(group.folders)
+                ? group.folders.filter(folder => folder && typeof folder.path === 'string' && folder.path).map(folder => ({
+                    id: folder.id || createConfigId('folder'),
+                    path: folder.path,
+                    name: folder.name || getFolderName(folder.path)
+                }))
+                : []
+        }));
+    }
+
+    const legacyFolders = Array.isArray(raw)
+        ? raw.filter(folder => folder && typeof folder.path === 'string' && folder.path)
+        : raw && typeof raw.path === 'string' && raw.path ? [raw] : [];
+    if (legacyFolders.length === 0) return [];
+
+    return [{
+        id: createConfigId('group'),
+        name: legacyName,
+        folders: legacyFolders.map(folder => ({
+            id: folder.id || createConfigId('folder'),
+            path: folder.path,
+            name: folder.name || getFolderName(folder.path)
+        }))
+    }];
+}
+
+function getFolderGroups(storageKey, legacyKey = null) {
+    const raw = readStoredJson(storageKey, null);
+    if (raw !== null) return normalizeFolderGroups(raw);
+    return legacyKey ? normalizeFolderGroups(readStoredJson(legacyKey, null)) : [];
+}
+
+function writeFolderGroups(storageKey, groups) {
+    writeStoredJson(storageKey, groups.map(group => ({
+        id: group.id,
+        name: group.name,
+        folders: group.folders.map(folder => ({
+            id: folder.id,
+            path: folder.path,
+            name: folder.name
+        }))
+    })));
+}
+
+function getCommonVideoGroups() {
+    return getFolderGroups(COMMON_VIDEO_FOLDERS_KEY);
+}
+
+function getMoveFolderGroups() {
+    return getFolderGroups(MOVE_FOLDERS_KEY, MOVE_FOLDER_KEY);
+}
+
+function getMoveFolders() {
+    return getMoveFolderGroups().flatMap(group => group.folders);
+}
+
+function getCollapsedFolderGroups(kind) {
+    const saved = readStoredJson(FOLDER_GROUP_COLLAPSE_KEY, {});
+    return new Set(Array.isArray(saved?.[kind]) ? saved[kind] : []);
+}
+
+function setFolderGroupCollapsed(kind, groupId, collapsed) {
+    const saved = readStoredJson(FOLDER_GROUP_COLLAPSE_KEY, {});
+    const ids = new Set(Array.isArray(saved?.[kind]) ? saved[kind] : []);
+    if (collapsed) ids.add(groupId);
+    else ids.delete(groupId);
+    writeStoredJson(FOLDER_GROUP_COLLAPSE_KEY, {
+        ...saved,
+        [kind]: [...ids]
+    });
+}
+
+function toggleFolderGroup(kind, groupId) {
+    const collapsed = getCollapsedFolderGroups(kind);
+    setFolderGroupCollapsed(kind, groupId, !collapsed.has(groupId));
+    kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
+}
+
+function getWallpaperFolder() {
+    const folder = readStoredJson(WALLPAPER_FOLDER_KEY, null);
+    return folder && typeof folder.path === 'string' && folder.path ? folder : null;
+}
+
+function getFolderName(path) {
+    return String(path || '').split(/[\\/]/).filter(Boolean).pop() || path || '未命名文件夹';
+}
+
+function renderFolderGroup(group, kind, groupIndex, groupCount = 1) {
+    const isCommon = kind === 'common';
+    const collapsed = getCollapsedFolderGroups(kind).has(group.id);
+    const folders = group.folders.map((folder, folderIndex) => `
+        <div class="directory-item directory-folder-item" data-folder-id="${escapeHtml(folder.id)}">
+            <div class="directory-item-main" tabindex="0" role="button">
+                <span class="directory-item-name">${escapeHtml(folder.name || getFolderName(folder.path))}</span>
+                <span class="directory-item-path" title="${escapeHtml(folder.path)}">${escapeHtml(folder.path)}</span>
+            </div>
+            <div class="directory-item-actions">
+                <button class="directory-item-action move-up" type="button" ${folderIndex === 0 ? 'disabled' : ''}>↑</button>
+                <button class="directory-item-action move-down" type="button" ${folderIndex === group.folders.length - 1 ? 'disabled' : ''}>↓</button>
+                <button class="directory-item-action edit-folder" type="button">编辑</button>
+                <button class="directory-item-action remove-folder" type="button">移除</button>
+            </div>
+        </div>
+    `).join('');
+
+    return `
+        <section class="directory-group${collapsed ? ' is-collapsed' : ''}" data-group-id="${escapeHtml(group.id)}">
+            <div class="directory-group-heading" tabindex="0" role="button" aria-expanded="${collapsed ? 'false' : 'true'}">
+                <div class="directory-group-title">
+                    <button class="directory-group-toggle" type="button" aria-label="${collapsed ? '展开' : '收起'}分组">
+                        <span class="directory-group-chevron">⌄</span>
+                    </button>
+                    <span class="directory-group-icon">▦</span>
+                    <span>${escapeHtml(group.name || '未命名分组')}</span>
+                    <small>${group.folders.length} 个文件夹</small>
+                </div>
+                <div class="directory-item-actions directory-group-actions">
+                    <button class="directory-item-action group-up" type="button" ${groupIndex === 0 ? 'disabled' : ''}>↑</button>
+                    <button class="directory-item-action group-down" type="button" ${groupIndex === groupCount - 1 ? 'disabled' : ''}>↓</button>
+                    <button class="directory-item-action edit-group" type="button">改名</button>
+                    <button class="directory-item-action remove-group" type="button">移除组</button>
+                </div>
+            </div>
+            <div class="directory-group-folders">
+                ${folders || '<div class="directory-empty">组内还没有文件夹</div>'}
+            </div>
+        </section>
+    `;
+}
+
+function reorderFolderGroup(kind, groupId, folderId, delta) {
+    const key = kind === 'common' ? COMMON_VIDEO_FOLDERS_KEY : MOVE_FOLDERS_KEY;
+    const groups = kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
+    const group = groups.find(item => item.id === groupId);
+    if (!group) return;
+    const index = group.folders.findIndex(folder => folder.id === folderId);
+    const nextIndex = index + delta;
+    if (index < 0 || nextIndex < 0 || nextIndex >= group.folders.length) return;
+    [group.folders[index], group.folders[nextIndex]] = [group.folders[nextIndex], group.folders[index]];
+    writeFolderGroups(key, groups);
+    kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
+}
+
+function reorderFolderGroupContainer(kind, groupId, delta) {
+    const key = kind === 'common' ? COMMON_VIDEO_FOLDERS_KEY : MOVE_FOLDERS_KEY;
+    const groups = kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
+    const index = groups.findIndex(group => group.id === groupId);
+    const nextIndex = index + delta;
+    if (index < 0 || nextIndex < 0 || nextIndex >= groups.length) return;
+    [groups[index], groups[nextIndex]] = [groups[nextIndex], groups[index]];
+    writeFolderGroups(key, groups);
+    kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
+}
+
+function removeConfiguredFolder(kind, groupId, folderId) {
+    const key = kind === 'common' ? COMMON_VIDEO_FOLDERS_KEY : MOVE_FOLDERS_KEY;
+    const groups = kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
+    const group = groups.find(item => item.id === groupId);
+    if (!group) return;
+    group.folders = group.folders.filter(folder => folder.id !== folderId);
+    writeFolderGroups(key, groups);
+    kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
+    showToast('文件夹已移除');
+}
+
+function removeFolderGroup(kind, groupId) {
+    const key = kind === 'common' ? COMMON_VIDEO_FOLDERS_KEY : MOVE_FOLDERS_KEY;
+    const groups = kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
+    const group = groups.find(item => item.id === groupId);
+    if (!group) return;
+    if (group.folders.length > 0 && !window.confirm(`分组“${group.name}”内还有文件夹，确定移除整个分组吗？`)) return;
+    writeFolderGroups(key, groups.filter(item => item.id !== groupId));
+    kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
+    showToast('分组已移除');
+}
+
+function renderCommonVideoFolders() {
+    const list = elements.commonVideoFolders;
+    if (!list) return;
+
+    const groups = getCommonVideoGroups();
+    if (groups.length === 0) {
+        list.innerHTML = '<div class="directory-empty">还没有配置常用文件夹，点击右上角添加。</div>';
+        return;
+    }
+
+    list.innerHTML = groups.map((group, index) => renderFolderGroup(group, 'common', index, groups.length)).join('');
+
+    bindFolderGroupActions(list, 'common');
+}
+
+function bindFolderGroupActions(list, kind) {
+    const groups = kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
+    list.querySelectorAll('.directory-group').forEach(groupElement => {
+        const groupId = groupElement.dataset.groupId;
+        const group = groups.find(item => item.id === groupId);
+        if (!group) return;
+        const heading = groupElement.querySelector('.directory-group-heading');
+        const toggle = () => toggleFolderGroup(kind, groupId);
+        heading?.addEventListener('click', event => {
+            if (event.target.closest('button')) return;
+            toggle();
+        });
+        heading?.addEventListener('keydown', event => {
+            if (event.target.closest('button')) return;
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                toggle();
+            }
+        });
+        groupElement.querySelector('.directory-group-toggle')?.addEventListener('click', toggle);
+        groupElement.querySelector('.group-up')?.addEventListener('click', () => reorderFolderGroupContainer(kind, groupId, -1));
+        groupElement.querySelector('.group-down')?.addEventListener('click', () => reorderFolderGroupContainer(kind, groupId, 1));
+        groupElement.querySelector('.edit-group')?.addEventListener('click', () => openFolderAliasModal({ kind, type: 'group', group }));
+        groupElement.querySelector('.remove-group')?.addEventListener('click', () => removeFolderGroup(kind, groupId));
+        groupElement.querySelectorAll('.directory-folder-item').forEach(folderElement => {
+            const folderId = folderElement.dataset.folderId;
+            const folder = group.folders.find(item => item.id === folderId);
+            if (!folder) return;
+            const open = () => openDesktopFolder(folder.path, folder.name || getFolderName(folder.path));
+            folderElement.querySelector('.directory-item-main')?.addEventListener('click', open);
+            folderElement.querySelector('.directory-item-main')?.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    open();
+                }
+            });
+            folderElement.querySelector('.move-up')?.addEventListener('click', () => reorderFolderGroup(kind, groupId, folderId, -1));
+            folderElement.querySelector('.move-down')?.addEventListener('click', () => reorderFolderGroup(kind, groupId, folderId, 1));
+            folderElement.querySelector('.edit-folder')?.addEventListener('click', () => openFolderAliasModal({ kind, type: 'folder', groupId, folder }));
+            folderElement.querySelector('.remove-folder')?.addEventListener('click', () => removeConfiguredFolder(kind, groupId, folderId));
+        });
+    });
+}
+
+function renderWallpaperFolderSummary() {
+    const summary = elements.wallpaperFolderSummary;
+    if (!summary) return;
+
+    const folder = getWallpaperFolder();
+    if (!folder) {
+        summary.innerHTML = '<span class="directory-empty">当前使用内置壁纸</span>';
+        return;
+    }
+
+    summary.innerHTML = `
+        <span class="directory-item-name">${escapeHtml(folder.name || getFolderName(folder.path))}</span>
+        <span class="directory-item-path" title="${escapeHtml(folder.path)}">${escapeHtml(folder.path)}</span>
+    `;
+}
+
+function renderMoveFolderSummary() {
+    const summary = elements.moveFolderSummary;
+    if (!summary) return;
+
+    const groups = getMoveFolderGroups();
+    if (groups.length === 0) {
+        summary.innerHTML = '<span class="directory-empty">尚未配置移动目标</span>';
+        updatePlayerActions();
+        return;
+    }
+
+    summary.innerHTML = groups.map((group, index) => renderFolderGroup(group, 'move', index, groups.length)).join('');
+    bindFolderGroupActions(summary, 'move');
+    updatePlayerActions();
+}
+
+function getWallpaperIntervalSeconds() {
+    const value = Number.parseInt(storage.getItem(WALLPAPER_INTERVAL_KEY), 10);
+    if (!Number.isFinite(value)) return DEFAULT_WALLPAPER_INTERVAL_SECONDS;
+    return Math.min(3600, Math.max(5, value));
+}
+
+function loadWallpaperIntervalOption() {
+    if (elements.wallpaperInterval) {
+        elements.wallpaperInterval.value = String(getWallpaperIntervalSeconds());
+    }
+}
+
+function saveWallpaperInterval() {
+    const value = Math.min(3600, Math.max(5, Number.parseInt(elements.wallpaperInterval?.value, 10) || DEFAULT_WALLPAPER_INTERVAL_SECONDS));
+    if (elements.wallpaperInterval) elements.wallpaperInterval.value = String(value);
+    storage.setItem(WALLPAPER_INTERVAL_KEY, String(value));
+    if (bgState.intervalId) startBgRotation();
+    showToast(`壁纸轮播间隔已设置为 ${value} 秒`);
+}
+
+function openFolderAliasModal(editor = {}) {
+    pendingFolderEditor = editor;
+    if (!elements.folderAliasModal) return;
+
+    const isGroup = editor.type === 'group';
+    const isCommon = editor.kind !== 'move';
+    const path = editor.folder?.path || editor.path || '';
+    const currentName = editor.group?.name || editor.folder?.name
+        || (isGroup ? '未命名分组' : getFolderName(path));
+    elements.folderAliasTitle.textContent = isGroup
+        ? `${editor.group ? '修改' : '添加'}${isCommon ? '常用文件夹' : '移动目标'}分组`
+        : `${editor.folder?.id ? '修改' : '添加'}${isCommon ? '常用视频文件夹' : '移动目标文件夹'}`;
+    elements.folderAliasPath.textContent = path;
+    elements.folderAliasPath.classList.toggle('hidden', isGroup);
+    elements.folderAliasInputLabel.textContent = isGroup ? '分组名称' : '文件夹名称';
+    elements.folderAliasInput.value = currentName;
+    elements.folderAliasGroupLabel.classList.toggle('hidden', isGroup);
+    elements.folderAliasGroup.classList.toggle('hidden', isGroup);
+    if (!isGroup) {
+        const groups = isCommon ? getCommonVideoGroups() : getMoveFolderGroups();
+        elements.folderAliasGroup.innerHTML = groups.length > 0
+            ? groups.map(group => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}</option>`).join('')
+            : '<option value="">未分组（保存时自动创建）</option>';
+        elements.folderAliasGroup.value = editor.groupId || groups[0]?.id || '';
+    }
+    elements.folderAliasModal.classList.remove('hidden');
+    requestAnimationFrame(() => {
+        elements.folderAliasInput.focus();
+        elements.folderAliasInput.select();
+    });
+}
+
+function closeFolderAliasModal() {
+    pendingFolderEditor = null;
+    elements.folderAliasModal?.classList.add('hidden');
+}
+
+function saveFolderAlias() {
+    const editor = pendingFolderEditor;
+    if (!editor) {
+        closeFolderAliasModal();
+        return;
+    }
+
+    const name = elements.folderAliasInput.value.trim() || (editor.type === 'group' ? '未命名分组' : getFolderName(editor.folder?.path || editor.path));
+    const key = editor.kind === 'common' ? COMMON_VIDEO_FOLDERS_KEY : MOVE_FOLDERS_KEY;
+    const groups = editor.kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
+
+    if (editor.type === 'group') {
+        if (editor.group?.id) {
+            const group = groups.find(item => item.id === editor.group.id);
+            if (group) group.name = name;
+        } else {
+            groups.push({ id: createConfigId('group'), name, folders: [] });
+        }
+    } else {
+        const path = editor.folder?.path || editor.path;
+        if (!path) {
+            closeFolderAliasModal();
+            return;
+        }
+        let targetGroup = groups.find(group => group.id === elements.folderAliasGroup.value);
+        if (!targetGroup) {
+            targetGroup = { id: createConfigId('group'), name: '未分组', folders: [] };
+            groups.push(targetGroup);
+        }
+        if (editor.folder?.id) {
+            const oldGroup = groups.find(group => group.folders.some(folder => folder.id === editor.folder.id));
+            const folder = oldGroup?.folders.find(item => item.id === editor.folder.id);
+            if (folder) {
+                oldGroup.folders = oldGroup.folders.filter(item => item.id !== folder.id);
+                targetGroup.folders.push({ ...folder, name, path });
+            }
+        } else {
+            targetGroup.folders.push({ id: createConfigId('folder'), path, name });
+        }
+    }
+
+    writeFolderGroups(key, groups);
+    editor.kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
+    closeFolderAliasModal();
+    showToast(editor.type === 'group' ? '分组名称已更新' : editor.folder?.id ? '文件夹名称已更新' : '文件夹已保存');
+}
+
+async function addCommonVideoFolder() {
+    if (!isDesktopApp) {
+        showToast('常用文件夹配置仅支持 Windows 桌面版');
+        return;
+    }
+
+    const path = await invokeDesktop('pick_folder');
+    if (path) openFolderAliasModal({ kind: 'common', type: 'folder', path });
+}
+
+function addCommonVideoGroup() {
+    openFolderAliasModal({ kind: 'common', type: 'group' });
+}
+
+async function scanWallpaperImageFiles(path) {
+    return invokeDesktop('scan_wallpaper_folder', {
+        path,
+        includeSubfolders: true
+    });
+}
+
+function wallpaperFilesToUrls(files) {
+    return Array.isArray(files)
+        ? files.map(file => getDesktopAssetUrl(file)).filter(Boolean)
+        : [];
+}
+
+async function getWallpaperCache(path) {
+    if (!isDesktopApp) return null;
+    if (!window.db) await initDB();
+
+    return new Promise((resolve, reject) => {
+        const transaction = window.db.transaction([WALLPAPER_CACHE_STORE_NAME], 'readonly');
+        const request = transaction.objectStore(WALLPAPER_CACHE_STORE_NAME).get('active');
+        request.onsuccess = () => {
+            const cache = request.result;
+            resolve(cache?.folderPath === path && Array.isArray(cache.files) ? cache.files : null);
+        };
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function saveWallpaperCache(path, files) {
+    if (!isDesktopApp || !Array.isArray(files)) return;
+    if (!window.db) await initDB();
+
+    return new Promise((resolve, reject) => {
+        const transaction = window.db.transaction([WALLPAPER_CACHE_STORE_NAME], 'readwrite');
+        const request = transaction.objectStore(WALLPAPER_CACHE_STORE_NAME).put({
+            id: 'active',
+            folderPath: path,
+            files,
+            updatedAt: Date.now()
+        });
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function configureWallpaperFolder() {
+    if (!isDesktopApp) {
+        showToast('壁纸文件夹配置仅支持 Windows 桌面版');
+        return;
+    }
+
+    try {
+        const path = await invokeDesktop('pick_wallpaper_folder');
+        if (!path) return;
+
+        showLoading(true);
+        const files = await scanWallpaperImageFiles(path);
+        const images = wallpaperFilesToUrls(files);
+        if (images.length === 0) {
+            showToast('该文件夹及子文件夹中没有可用图片');
+            return;
+        }
+
+        const folder = { path, name: getFolderName(path) };
+        writeStoredJson(WALLPAPER_FOLDER_KEY, folder);
+        await saveWallpaperCache(path, files);
+        renderWallpaperFolderSummary();
+        bgState.images = images;
+        bgState.currentIndex = Math.floor(Math.random() * images.length);
+        startBgRotation();
+        showToast(`已加载 ${images.length} 张壁纸`);
+    } catch (error) {
+        console.error('读取壁纸文件夹失败:', error);
+        showToast(`壁纸读取失败：${error?.message || error}`);
+    } finally {
+        showLoading(false);
+    }
+}
+
+async function configureMoveFolder() {
+    if (!isDesktopApp) {
+        showToast('移动文件功能仅支持 Windows 桌面版');
+        return;
+    }
+
+    try {
+        const path = await invokeDesktop('pick_move_folder');
+        if (!path) return;
+
+        openFolderAliasModal({ kind: 'move', type: 'folder', path });
+    } catch (error) {
+        console.error('配置移动目标失败:', error);
+        showToast(`配置失败：${error?.message || error}`);
+    }
+}
+
+function addMoveFolderGroup() {
+    openFolderAliasModal({ kind: 'move', type: 'group' });
+}
+
+/* 保留旧配置读取兼容性；首次保存新的分组配置时会自然迁移到 moveFolders。 */
+function migrateFolderConfiguration() {
+    const commonRaw = readStoredJson(COMMON_VIDEO_FOLDERS_KEY, null);
+    if (commonRaw !== null && !(Array.isArray(commonRaw) && commonRaw.some(item => Array.isArray(item?.folders)))) {
+        writeFolderGroups(COMMON_VIDEO_FOLDERS_KEY, normalizeFolderGroups(commonRaw));
+    }
+    const moveRaw = readStoredJson(MOVE_FOLDERS_KEY, null);
+    if (moveRaw === null) {
+        const legacyMove = readStoredJson(MOVE_FOLDER_KEY, null);
+        if (legacyMove) writeFolderGroups(MOVE_FOLDERS_KEY, normalizeFolderGroups(legacyMove));
+    }
+}
+
 // 使用清单按需加载，避免启动时探测并解码全部超大背景图。
-function loadBackgroundImages() {
-    const images = Array.isArray(window.INFINITY_LOOP_BACKGROUNDS)
+async function loadBackgroundImages() {
+    let images = Array.isArray(window.INFINITY_LOOP_BACKGROUNDS)
         ? window.INFINITY_LOOP_BACKGROUNDS.filter(path => typeof path === 'string' && path)
         : [];
 
+    renderWallpaperFolderSummary();
+    renderMoveFolderSummary();
+    const wallpaperFolder = getWallpaperFolder();
+    if (isDesktopApp && wallpaperFolder) {
+        try {
+            // 配置壁纸时才扫描；启动时直接使用 IndexedDB 清单，避免重复遍历大目录。
+            let customFiles = await getWallpaperCache(wallpaperFolder.path);
+            if (!customFiles) {
+                customFiles = await scanWallpaperImageFiles(wallpaperFolder.path);
+                await saveWallpaperCache(wallpaperFolder.path, customFiles);
+            }
+            const customImages = wallpaperFilesToUrls(customFiles);
+            if (customImages.length > 0) images = customImages;
+        } catch (error) {
+            console.warn('加载已配置壁纸文件夹失败，将使用内置壁纸:', error);
+        }
+    }
+
     if (images.length === 0) {
-        console.warn('未找到背景图片清单');
+        console.warn('未找到背景图片');
         return;
     }
 
@@ -442,11 +1324,15 @@ function loadBackgroundImages() {
 function startBgRotation() {
     if (bgState.images.length === 0) return;
 
+    if (bgState.intervalId) {
+        clearInterval(bgState.intervalId);
+    }
+
     // 设置初始背景（直接显示，不渐变）
     const initialBg = bgState.images[bgState.currentIndex];
     bgState.bgLayer1.style.backgroundImage = `url('${initialBg}')`;
 
-    // 每6秒随机切换（避免短期内重复）
+    // 按设置的间隔随机切换，避免重复扫描壁纸目录。
     bgState.intervalId = setInterval(() => {
         let newIndex;
         let attempts = 0;
@@ -456,7 +1342,21 @@ function startBgRotation() {
         } while (newIndex === bgState.currentIndex && bgState.images.length > 1 && attempts < 10);
         bgState.currentIndex = newIndex;
         updateBgImage();
-    }, 5000);
+    }, getWallpaperIntervalSeconds() * 1000);
+}
+
+function setBackgroundActive(active) {
+    const layers = [bgState.bgLayer1, bgState.bgLayer2].filter(Boolean);
+    layers.forEach(layer => layer.classList.toggle('background-suspended', !active));
+
+    if (active) {
+        if (!bgState.intervalId && bgState.images.length > 0) {
+            startBgRotation();
+        }
+    } else if (bgState.intervalId) {
+        clearInterval(bgState.intervalId);
+        bgState.intervalId = null;
+    }
 }
 
 // 更新背景图（渐隐→切换→渐显）
@@ -511,7 +1411,11 @@ function init() {
     initBgLayers();
     bindEvents();
     loadLastFolder();
-    loadBackgroundImages();
+    migrateFolderConfiguration();
+    renderCommonVideoFolders();
+    loadWallpaperIntervalOption();
+    renderMoveFolderSummary();
+    loadBackgroundImages().catch(error => console.error('加载壁纸失败:', error));
     loadIncludeSubfoldersOption();
     console.log('✅ 播放器初始化完成');
 }
@@ -625,6 +1529,9 @@ function initDB() {
             }
             if (!db.objectStoreNames.contains(PRESET_STORE_NAME)) {
                 db.createObjectStore(PRESET_STORE_NAME, { keyPath: 'id' });
+            }
+            if (!db.objectStoreNames.contains(WALLPAPER_CACHE_STORE_NAME)) {
+                db.createObjectStore(WALLPAPER_CACHE_STORE_NAME, { keyPath: 'id' });
             }
         };
     });
@@ -846,7 +1753,6 @@ async function readDirectoryHandle(dirHandle, files, includeSubfolders = true, c
             const file = await entry.getFile();
             // 创建一个新对象来保存文件和路径信息
             const fullPath = currentPath + file.name;
-            console.log('📁 读取文件:', fullPath); // 调试输出
             const fileWithPath = {
                 _file: file,
                 name: file.name,
@@ -857,7 +1763,6 @@ async function readDirectoryHandle(dirHandle, files, includeSubfolders = true, c
                 // 保存原始文件的引用用于播放
                 get file() { return this._file; }
             };
-            console.log('✅ 文件对象 webkitRelativePath:', fileWithPath.webkitRelativePath); // 调试输出
             files.push(fileWithPath);
         } else if (entry.kind === 'directory' && includeSubfolders) {
             await readDirectoryHandle(entry, files, includeSubfolders, currentPath + entry.name + '/');
@@ -899,8 +1804,7 @@ async function loadPresetPath(id, hint) {
 
             processFiles(files);
         } else {
-            // 降级到普通文件选择
-            elements.folderInput.click();
+            showToast('当前环境不支持文件夹选择，请使用 Windows 桌面版');
         }
     } catch (error) {
         if (error.name !== 'AbortError') {
@@ -910,7 +1814,7 @@ async function loadPresetPath(id, hint) {
 }
 
 // Windows 桌面模式使用原生文件夹选择器和 mpv 可读取的真实路径。
-async function openDesktopFolder(folderPath = null) {
+async function openDesktopFolder(folderPath = null, displayName = '') {
     if (!isDesktopApp) return;
 
     let handedOffToPlayer = false;
@@ -932,7 +1836,7 @@ async function openDesktopFolder(folderPath = null) {
             return;
         }
 
-        const folderName = selectedPath.split(/[\\/]/).filter(Boolean).pop() || selectedPath;
+        const folderName = displayName || getFolderName(selectedPath);
         storage.setItem('lastDesktopFolder', selectedPath);
         storage.setItem('lastFolderName', folderName);
         storage.setItem('lastFolderTimestamp', Date.now().toString());
@@ -950,87 +1854,37 @@ async function openDesktopFolder(folderPath = null) {
 
 // 绑定事件
 function bindEvents() {
-    console.log('🔗 绑定事件监听器...');
-
-    // 上传区域点击 - 使用 showDirectoryPicker
-    elements.uploadArea.addEventListener('click', async (e) => {
-        // 防止重复触发（如果有 input 元素被点击）
-        if (e.target.tagName === 'INPUT') return;
-
-        console.log('📁 点击上传区域，开始选择文件夹');
-
-        if (isDesktopApp) {
-            await openDesktopFolder();
-            return;
-        }
-
-        // 如果浏览器支持 File System Access API，直接使用
-        if ('showDirectoryPicker' in window) {
-            try {
-                console.log('🔍 调用 showDirectoryPicker...');
-                const handle = await window.showDirectoryPicker();
-                console.log('✅ 已选择文件夹:', handle.name);
-
-                const includeSubfolders = elements.includeSubfolders.checked;
-                const files = [];
-                await readDirectoryHandle(handle, files, includeSubfolders, handle.name + '/');
-
-                // 筛选视频文件
-                let videoFiles = files.filter(file => {
-                    const ext = '.' + file.name.split('.').pop().toLowerCase();
-                    return VIDEO_FORMATS.includes(ext);
-                });
-
-                if (videoFiles.length === 0) {
-                    showToast('⚠️ 未找到视频文件！支持格式：' + VIDEO_FORMATS.join(', '));
-                    return;
-                }
-
-                // 保存文件夹信息
-                const folderId = Date.now().toString();
-                storage.setItem('lastFolderId', folderId);
-                storage.setItem('lastFolderName', handle.name);
-                storage.setItem('lastFolderTimestamp', Date.now().toString());
-
-                console.log('💾 已保存文件夹信息:', { folderId, folderName: handle.name, instanceId: INSTANCE_ID });
-                console.log('💾 验证保存:', storage.getItem('lastFolderId'));
-
-                // 保存句柄到 IndexedDB
-                await savePath(folderId, handle, handle.name);
-                await loadSavedPaths();
-
-                processFiles(videoFiles, handle);
-                showToast('✅ 已启用自动刷新功能');
-                return;
-            } catch (err) {
-                if (err.name !== 'AbortError') {
-                    console.error('选择文件夹失败:', err);
-                }
-                // 用户取消，不继续
-                return;
-            }
-        }
-
-        // 不支持 API，使用普通文件选择器
-        elements.folderInput.click();
+    elements.addVideoFolder?.addEventListener('click', addCommonVideoFolder);
+    elements.addVideoGroup?.addEventListener('click', addCommonVideoGroup);
+    elements.configureWallpaperFolder?.addEventListener('click', configureWallpaperFolder);
+    elements.configureMoveFolder?.addEventListener('click', configureMoveFolder);
+    elements.addMoveGroup?.addEventListener('click', addMoveFolderGroup);
+    elements.wallpaperInterval?.addEventListener('change', saveWallpaperInterval);
+    elements.deleteCurrentVideo?.addEventListener('click', deleteCurrentVideoToRecycleBin);
+    elements.folderAliasClose?.addEventListener('click', closeFolderAliasModal);
+    elements.folderAliasCancel?.addEventListener('click', closeFolderAliasModal);
+    elements.folderAliasConfirm?.addEventListener('click', saveFolderAlias);
+    elements.folderAliasInput?.addEventListener('keydown', event => {
+        if (event.key === 'Enter') saveFolderAlias();
+        if (event.key === 'Escape') closeFolderAliasModal();
     });
+    elements.folderAliasModal?.addEventListener('click', event => {
+        if (event.target === elements.folderAliasModal) closeFolderAliasModal();
+    });
+    document.addEventListener('pointerdown', event => {
+        if (activeMoveTargetMenu && !event.target.closest('.move-target-actions')) closeMoveTargetMenu();
+    });
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') closeMoveTargetMenu();
+    });
+
+    console.log('🔗 绑定事件监听器...');
 
     // 包含子文件夹选项变化时保存
     elements.includeSubfolders.addEventListener('change', () => {
         const isChecked = elements.includeSubfolders.checked;
         storage.setItem('includeSubfolders', isChecked.toString());
         console.log('💾 已保存"包含子文件夹"选项:', isChecked);
-    });
-
-    // 文件夹选择 input 变化事件（用于不支持 File System Access API 的浏览器）
-    elements.folderInput.addEventListener('change', (e) => {
-        const files = Array.from(e.target.files);
-        if (files.length > 0) {
-            console.log('📁 已选择文件夹（传统方式）:', files.length, '个文件');
-            showLoading(true);
-            processFiles(files);
-            showLoading(false);
-        }
     });
 
     // 继续观看按钮
@@ -1093,31 +1947,6 @@ function bindEvents() {
         }
     });
 
-    // 拖拽上传
-    elements.uploadArea.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        elements.uploadArea.classList.add('drag-over');
-    });
-
-    elements.uploadArea.addEventListener('dragleave', () => {
-        elements.uploadArea.classList.remove('drag-over');
-    });
-
-    elements.uploadArea.addEventListener('drop', (e) => {
-        e.preventDefault();
-        elements.uploadArea.classList.remove('drag-over');
-        const items = e.dataTransfer.items;
-        handleDroppedItems(items);
-    });
-
-    if (isDesktopApp && window.__TAURI__.event?.listen) {
-        window.__TAURI__.event.listen('tauri://drag-drop', event => {
-            const payload = getTauriPayload(event);
-            const droppedPath = payload?.paths?.[0];
-            if (droppedPath) openDesktopFolder(droppedPath);
-        }).catch(error => console.debug('桌面拖拽事件不可用:', error));
-    }
-
     // 播放页面控制
     elements.backBtn.addEventListener('click', goHome);
     elements.closePlaylist.addEventListener('click', () => {
@@ -1152,7 +1981,10 @@ function bindEvents() {
     // 键盘快捷键
     document.addEventListener('keydown', handleKeyboard);
     if (isDesktopApp) {
-        window.addEventListener('resize', scheduleDesktopSurfaceSync);
+        window.addEventListener('resize', () => {
+            updateDesktopVideoMask();
+            scheduleDesktopSurfaceSync();
+        });
     }
     console.log('✅ 键盘事件监听器已绑定');
 }
@@ -1275,6 +2107,8 @@ function processFiles(files, folderHandle = null) {
     showLoading(true);
 
     if (isDesktopApp) {
+        desktopState.mode = 'mpv';
+        desktopState.navigationRequest += 1;
         renderVideos(0);
         updateVideoInfoBar();
         showPlayer();
@@ -1359,16 +2193,12 @@ function loadVideoAroundIndex(index) {
     const videoItems = elements.videoContainer.querySelectorAll('.video-item');
 
     if (isDesktopApp) {
-        const previousIndex = state.currentIndex;
         state.currentIndex = index;
         const surface = elements.videoContainer.querySelector('.native-video-surface');
         if (surface) surface.dataset.index = index;
 
-        const signature = getPlaylistSignature();
-        if (desktopState.started && signature && desktopState.playlistSignature !== signature) {
-            desktopPlayer.loadPlaylist().catch(error => console.error('同步 mpv 播放列表失败:', error));
-        } else if (desktopState.started && previousIndex !== index) {
-            desktopPlayer.loadIndex(index).catch(error => console.error('切换 mpv 播放项目失败:', error));
+        if (desktopState.started && state.playlist[index]?.path) {
+            queueDesktopNavigation(index);
         }
 
         updateVideoCount();
@@ -1412,16 +2242,13 @@ function createDesktopVideoSurface(item, index) {
     const surface = document.createElement('div');
     surface.className = 'native-video-surface';
     surface.dataset.index = index;
+    surface.addEventListener('pointerdown', () => window.focus(), { passive: true });
+    surface.addEventListener('click', togglePlay);
     item.appendChild(surface);
 }
 
 // 创建视频元素
 function createVideoElement(item, index) {
-    if (isDesktopApp) {
-        createDesktopVideoSurface(item, index);
-        return;
-    }
-
     const video = state.playlist[index];
 
     // 保存触发区域（如果存在）
@@ -1437,6 +2264,7 @@ function createVideoElement(item, index) {
 
     const videoEl = document.createElement('video');
     videoEl.src = URL.createObjectURL(video._file || video);
+    videoEl.preload = 'metadata';
     videoEl.loop = state.options.loopSingle;
     videoEl.playsInline = true;
     videoEl.dataset.index = index;
@@ -1818,6 +2646,83 @@ function reshuffleAndKeepPosition() {
 function updateVideoCount() {
     elements.videoCount.textContent = `${state.currentIndex + 1} / ${state.playlist.length}`;
     updateVideoInfoBar();
+    updatePlayerActions();
+}
+
+function updatePlayerActions() {
+    const currentVideo = state.playlist[state.currentIndex];
+    const canOperate = isDesktopApp && Boolean(currentVideo?.path);
+    const hasMoveTarget = getMoveFolders().length > 0;
+
+    if (elements.deleteCurrentVideo) {
+        elements.deleteCurrentVideo.disabled = !canOperate;
+        elements.deleteCurrentVideo.title = canOperate ? '删除当前视频到回收站' : '当前视频不可操作';
+    }
+    renderMoveTargetActions(canOperate && hasMoveTarget);
+}
+
+function closeMoveTargetMenu() {
+    activeMoveTargetMenu?.remove();
+    activeMoveTargetMenu = null;
+}
+
+function moveTargetIcon() {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4l2 2h7A2.5 2.5 0 0 1 21 9.5v7a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5v-9Z"/><path d="M8 13h8M13 10l3 3-3 3"/></svg>';
+}
+
+function openMoveTargetMenu(button, group) {
+    closeMoveTargetMenu();
+    const menu = document.createElement('div');
+    menu.className = 'move-target-menu';
+    menu.innerHTML = `
+        <div class="move-target-menu-title">${escapeHtml(group.name || '移动目标')}</div>
+        ${group.folders.map(folder => `
+            <button class="move-target-menu-item" type="button" data-folder-id="${escapeHtml(folder.id)}">
+                <span class="move-target-menu-name">${escapeHtml(folder.name || getFolderName(folder.path))}</span>
+                <span class="move-target-menu-path">${escapeHtml(folder.path)}</span>
+            </button>
+        `).join('')}
+    `;
+    elements.moveTargetActions.appendChild(menu);
+    menu.style.top = `${Math.max(0, button.offsetTop - 4)}px`;
+    menu.querySelectorAll('.move-target-menu-item').forEach(item => {
+        const folder = group.folders.find(value => value.id === item.dataset.folderId);
+        item.addEventListener('click', () => {
+            closeMoveTargetMenu();
+            moveCurrentVideoToFolder(folder);
+        });
+    });
+    activeMoveTargetMenu = menu;
+}
+
+function renderMoveTargetActions(enabled) {
+    const container = elements.moveTargetActions;
+    if (!container) return;
+    closeMoveTargetMenu();
+    const groups = getMoveFolderGroups().filter(group => group.folders.length > 0);
+    if (groups.length === 0) {
+        container.innerHTML = '';
+        return;
+    }
+
+    container.innerHTML = groups.map(group => `
+        <button class="player-action move-target-action" type="button" data-group-id="${escapeHtml(group.id)}"
+            title="移动到${escapeHtml(group.name || '目标分组')}" aria-label="移动到${escapeHtml(group.name || '目标分组')}" ${enabled ? '' : 'disabled'}>
+            ${moveTargetIcon()}
+            <span>${escapeHtml(group.name || '移动')}</span>
+        </button>
+    `).join('');
+    container.querySelectorAll('.move-target-action').forEach(button => {
+        const group = groups.find(value => value.id === button.dataset.groupId);
+        button.addEventListener('click', () => {
+            if (!group) return;
+            if (group.folders.length === 1) {
+                moveCurrentVideoToFolder(group.folders[0]);
+            } else {
+                openMoveTargetMenu(button, group);
+            }
+        });
+    });
 }
 
 // 更新顶部视频信息栏
@@ -1835,9 +2740,95 @@ function updatePlaylistHighlight() {
     elements.playlistContent.children[state.currentIndex]?.classList.add('active');
 }
 
+function removeCurrentVideoFromPlaylist(message) {
+    const currentVideo = state.playlist[state.currentIndex];
+    if (!currentVideo) return;
+
+    const removedIndex = state.currentIndex;
+    state.playlist.splice(removedIndex, 1);
+    state.videos = state.videos.filter(video => video !== currentVideo && video.path !== currentVideo.path);
+
+    if (state.playlist.length === 0) {
+        showToast(message);
+        goHome();
+        return;
+    }
+
+    // 删除当前项后，优先播放原来紧随其后的项；删掉末项时从列表头部继续。
+    const nextIndex = removedIndex < state.playlist.length ? removedIndex : 0;
+    state.currentIndex = nextIndex;
+    renderPlaylist();
+    updateVideoCount();
+    updatePlaylistHighlight();
+
+    if (isDesktopApp) {
+        loadVideoAroundIndex(nextIndex);
+        if (state.options.autoPlay) queueDesktopPlay(desktopState.navigationRequest);
+    }
+    showToast(message);
+}
+
+function setPlayerActionBusy(busy) {
+    [elements.deleteCurrentVideo, ...document.querySelectorAll('.move-target-action')].forEach(button => {
+        if (button) button.disabled = busy;
+    });
+    if (busy) closeMoveTargetMenu();
+}
+
+async function deleteCurrentVideoToRecycleBin() {
+    const video = state.playlist[state.currentIndex];
+    if (!isDesktopApp || !video?.path) {
+        showToast('当前视频无法执行文件操作');
+        return;
+    }
+
+    if (!window.confirm(`确定将“${video.name}”移动到回收站吗？`)) return;
+
+    setPlayerActionBusy(true);
+    try {
+        await invokeDesktop('send_to_recycle_bin', { path: video.path });
+        removeCurrentVideoFromPlaylist('已移入回收站，已切换到下一个视频');
+    } catch (error) {
+        console.error('删除视频失败:', error);
+        showToast(`删除失败：${error?.message || error}`);
+        updatePlayerActions();
+    } finally {
+        setPlayerActionBusy(false);
+        updatePlayerActions();
+    }
+}
+
+async function moveCurrentVideoToFolder(folder = null) {
+    const video = state.playlist[state.currentIndex];
+    if (!isDesktopApp || !video?.path) {
+        showToast('当前视频无法执行文件操作');
+        return;
+    }
+    if (!folder?.path) {
+        showToast('请先在首页配置移动目标文件夹');
+        return;
+    }
+
+    setPlayerActionBusy(true);
+    try {
+        await invokeDesktop('move_file_to_folder', {
+            path: video.path,
+            destinationDir: folder.path
+        });
+        removeCurrentVideoFromPlaylist(`已移动到“${folder.name || getFolderName(folder.path)}”，已切换到下一个视频`);
+    } catch (error) {
+        console.error('移动视频失败:', error);
+        showToast(`移动失败：${error?.message || error}`);
+        updatePlayerActions();
+    } finally {
+        setPlayerActionBusy(false);
+        updatePlayerActions();
+    }
+}
+
 // 更新循环状态
 function updateLoopState() {
-    if (isDesktopApp) {
+    if (isDesktopApp && desktopState.mode === 'mpv') {
         desktopPlayer.loop = state.options.loopSingle;
         return;
     }
@@ -1940,7 +2931,9 @@ function jumpToVideo(index) {
 
     if (isDesktopApp) {
         loadVideoAroundIndex(index);
-        if (state.options.autoPlay) desktopPlayer.play().catch(() => {});
+        if (state.options.autoPlay) {
+            queueDesktopPlay(desktopState.navigationRequest);
+        }
         return;
     }
 
@@ -1962,6 +2955,10 @@ function jumpToVideo(index) {
 function showPlayer() {
     elements.homePage.classList.add('hidden');
     elements.playerPage.classList.remove('hidden');
+    if (isDesktopApp) {
+        document.body.classList.add('desktop-player-mode');
+    }
+    setBackgroundActive(isDesktopApp);
     // 隐藏继续观看按钮
     elements.continueWatching.classList.add('hidden');
     if (isDesktopApp) scheduleDesktopSurfaceSync();
@@ -1977,14 +2974,21 @@ function goHome() {
     });
 
     if (isDesktopApp && desktopState.started) {
+        desktopState.navigationRequest += 1;
         if (desktopState.fullscreen) {
             invokeDesktop('set_fullscreen', { fullscreen: false }).catch(() => {});
             desktopState.fullscreen = false;
         }
-        invokeDesktop('mpv_stop').catch(error => console.debug('停止 mpv 失败:', error));
+        invokeDesktop('plugin:libmpv|destroy', { windowLabel: MPV_WINDOW_LABEL })
+            .catch(error => console.debug('停止 libmpv 失败:', error));
         desktopState.started = false;
-        desktopState.playlistSignature = '';
+        desktopState.mode = 'idle';
         desktopState.lastSurfaceRect = '';
+    }
+
+    if (isDesktopApp && !desktopState.started) {
+        desktopState.navigationRequest += 1;
+        desktopState.mode = 'idle';
     }
 
     // 重置状态
@@ -1998,6 +3002,10 @@ function goHome() {
     // 显示首页
     elements.playerPage.classList.add('hidden');
     elements.homePage.classList.remove('hidden');
+    if (isDesktopApp) {
+        document.body.classList.remove('desktop-player-mode');
+    }
+    setBackgroundActive(true);
     elements.playlist.classList.remove('show');
 
     // 重新显示继续观看按钮
@@ -2048,6 +3056,8 @@ function formatTime(seconds) {
 
 // 键盘快捷键
 function handleKeyboard(e) {
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+
     // 调试：检测所有键盘事件
     if (e.ctrlKey && e.altKey) {
         console.log('🎯 检测到 Ctrl + Alt 组合, key:', e.key, 'keyCode:', e.keyCode);
@@ -2065,7 +3075,7 @@ function handleKeyboard(e) {
         return;
     }
 
-    switch(e.key) {
+    switch(key) {
         case ' ':
         case 'k':
             // 空格或K键：播放/暂停
@@ -2118,7 +3128,7 @@ function handleKeyboard(e) {
             if (document.fullscreenElement) {
                 document.exitFullscreen();
             } else {
-                currentVideo.requestFullscreen();
+                currentVideo.requestFullscreen?.();
             }
             break;
         case '0':
@@ -2139,7 +3149,7 @@ function handleKeyboard(e) {
     }
 
     // Ctrl + Alt + C 复制文件名
-    if (e.ctrlKey && e.altKey && e.key === 'c') {
+    if (e.ctrlKey && e.altKey && key === 'c') {
         e.preventDefault();
         console.log('快捷键触发: Ctrl + Alt + C');
         copyCurrentFileName();
