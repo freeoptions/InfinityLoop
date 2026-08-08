@@ -36,6 +36,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "icon": [
+      "icons/icon.ico"
+    ],
     "resources": [
       "lib/libmpv-2.dll",
       "lib/libmpv-wrapper.dll"

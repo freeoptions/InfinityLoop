@@ -118,8 +118,19 @@ body {
 }
 
 .home-intro {
+    position: relative;
     padding: 10px 8px 16px;
+    padding-left: 60px;
     text-align: left;
+}
+
+.home-app-icon {
+    position: absolute;
+    top: 10px;
+    left: 8px;
+    width: 42px;
+    height: 42px;
+    object-fit: contain;
 }
 
 .home-eyebrow {

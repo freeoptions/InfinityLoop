@@ -1,76 +1,199 @@
+param(
+    [string]$SourcePath = ''
+)
+
 $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Drawing
 
-$iconDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) 'src-tauri\icons'
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$iconDirectory = Join-Path $projectRoot 'src-tauri\icons'
+$pngPath = Join-Path $projectRoot 'app-icon.png'
+$icoPath = Join-Path $iconDirectory 'icon.ico'
+
+if ([string]::IsNullOrWhiteSpace($SourcePath)) {
+    $sourceMatches = @(
+        Get-ChildItem -LiteralPath 'D:\@Software' -Recurse -File -Filter 'Artemis-symbol-ultra-4096.png' |
+            Where-Object { $_.FullName -like '*\Upscaled-4096\*' }
+    )
+    if ($sourceMatches.Count -ne 1) {
+        throw "Expected exactly one Artemis icon source under D:\@Software, found $($sourceMatches.Count). Pass -SourcePath explicitly."
+    }
+    $SourcePath = $sourceMatches[0].FullName
+}
+
+if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+    throw "Icon source not found: $SourcePath"
+}
+
 New-Item -ItemType Directory -Force -Path $iconDirectory | Out-Null
 
-$size = 256
-$bitmap = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-$graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-$graphics.Clear([System.Drawing.Color]::FromArgb(11, 16, 32))
+function New-ResizedIconBitmap {
+    param(
+        [System.Drawing.Bitmap]$Source,
+        [System.Drawing.Rectangle]$SourceRectangle,
+        [int]$Size
+    )
 
-$cardPath = New-Object System.Drawing.Drawing2D.GraphicsPath
-$cardPath.AddRectangle([System.Drawing.RectangleF]::new(16, 16, 224, 224))
-$cardBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-    [System.Drawing.RectangleF]::new(16, 16, 240, 240),
-    [System.Drawing.Color]::FromArgb(28, 40, 78),
-    [System.Drawing.Color]::FromArgb(16, 24, 48),
-    135
-)
-$graphics.FillPath($cardBrush, $cardPath)
+    $output = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $graphics = [System.Drawing.Graphics]::FromImage($output)
+    try {
+        $graphics.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+        $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+        $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+        $graphics.Clear([System.Drawing.Color]::Transparent)
+        $destination = [System.Drawing.Rectangle]::new(0, 0, $Size, $Size)
+        $graphics.DrawImage($Source, $destination, $SourceRectangle, [System.Drawing.GraphicsUnit]::Pixel)
+    }
+    finally {
+        $graphics.Dispose()
+    }
 
-$shadowPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(85, 110, 170), 30)
-$shadowPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-$shadowPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-$loopPath = New-Object System.Drawing.Drawing2D.GraphicsPath
-$loopPath.AddBezier(128, 128, 93, 76, 58, 76, 58, 128)
-$loopPath.AddBezier(58, 128, 58, 180, 93, 180, 128, 128)
-$loopPath.AddBezier(128, 128, 163, 76, 198, 76, 198, 128)
-$loopPath.AddBezier(198, 128, 198, 180, 163, 180, 128, 128)
-$graphics.DrawPath($shadowPen, $loopPath)
+    return $output
+}
 
-$loopPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(245, 248, 255), 22)
-$loopPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-$loopPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-$graphics.DrawPath($loopPen, $loopPath)
+function Get-VisibleBounds {
+    param(
+        [System.Drawing.Bitmap]$Bitmap,
+        [byte]$AlphaThreshold = 8
+    )
 
-$accentBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(106, 146, 255))
-$graphics.FillEllipse($accentBrush, 185, 48, 16, 16)
+    $rectangle = [System.Drawing.Rectangle]::new(0, 0, $Bitmap.Width, $Bitmap.Height)
+    $data = $Bitmap.LockBits(
+        $rectangle,
+        [System.Drawing.Imaging.ImageLockMode]::ReadOnly,
+        [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+    )
 
-$pngPath = Join-Path ([System.IO.Path]::GetTempPath()) ('InfinityLoop-icon-' + [guid]::NewGuid().ToString('N') + '.png')
-$icoPath = Join-Path $iconDirectory 'icon.ico'
-$bitmap.Save($pngPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    try {
+        $stride = [Math]::Abs($data.Stride)
+        $bytes = New-Object byte[] ($stride * $Bitmap.Height)
+        [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
 
-$graphics.Dispose()
-$cardBrush.Dispose()
-$cardPath.Dispose()
-$shadowPen.Dispose()
-$loopPen.Dispose()
-$loopPath.Dispose()
-$accentBrush.Dispose()
-$bitmap.Dispose()
+        $minX = $Bitmap.Width
+        $minY = $Bitmap.Height
+        $maxX = -1
+        $maxY = -1
 
-$pngBytes = [System.IO.File]::ReadAllBytes($pngPath)
-$stream = New-Object System.IO.FileStream($icoPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
-$writer = New-Object System.IO.BinaryWriter($stream)
-$writer.Write([uint16]0)
-$writer.Write([uint16]1)
-$writer.Write([uint16]1)
-$writer.Write([byte]0)
-$writer.Write([byte]0)
-$writer.Write([byte]0)
-$writer.Write([byte]0)
-$writer.Write([uint16]1)
-$writer.Write([uint16]32)
-$writer.Write([uint32]$pngBytes.Length)
-$writer.Write([uint32]22)
-$writer.Write($pngBytes)
-$writer.Flush()
-$writer.Dispose()
-$stream.Dispose()
+        for ($y = 0; $y -lt $Bitmap.Height; $y++) {
+            $rowOffset = $y * $stride
+            for ($x = 0; $x -lt $Bitmap.Width; $x++) {
+                if ($bytes[$rowOffset + ($x * 4) + 3] -gt $AlphaThreshold) {
+                    if ($x -lt $minX) { $minX = $x }
+                    if ($x -gt $maxX) { $maxX = $x }
+                    if ($y -lt $minY) { $minY = $y }
+                    if ($y -gt $maxY) { $maxY = $y }
+                }
+            }
+        }
 
-Remove-Item -LiteralPath $pngPath -Force
-Write-Output "InfinityLoop icon created: $icoPath"
+        if ($maxX -lt 0 -or $maxY -lt 0) {
+            throw "The icon source has no pixels above alpha threshold $AlphaThreshold."
+        }
+
+        return [System.Drawing.Rectangle]::FromLTRB($minX, $minY, $maxX + 1, $maxY + 1)
+    }
+    finally {
+        $Bitmap.UnlockBits($data)
+    }
+}
+
+function Get-SquareCrop {
+    param(
+        [System.Drawing.Rectangle]$Bounds,
+        [int]$ImageWidth,
+        [int]$ImageHeight,
+        [int]$Padding
+    )
+
+    $side = [Math]::Max($Bounds.Width, $Bounds.Height) + ($Padding * 2)
+    $side = [Math]::Min($side, [Math]::Min($ImageWidth, $ImageHeight))
+    $centerX = $Bounds.Left + ($Bounds.Width / 2.0)
+    $centerY = $Bounds.Top + ($Bounds.Height / 2.0)
+    $left = [int][Math]::Round($centerX - ($side / 2.0))
+    $top = [int][Math]::Round($centerY - ($side / 2.0))
+    $left = [Math]::Max(0, [Math]::Min($left, $ImageWidth - $side))
+    $top = [Math]::Max(0, [Math]::Min($top, $ImageHeight - $side))
+    return [System.Drawing.Rectangle]::new($left, $top, $side, $side)
+}
+
+$source = New-Object System.Drawing.Bitmap($SourcePath)
+try {
+    $visibleBounds = Get-VisibleBounds -Bitmap $source -AlphaThreshold 8
+    $padding = [int][Math]::Round([Math]::Max($source.Width, $source.Height) * 0.02)
+    $crop = Get-SquareCrop -Bounds $visibleBounds -ImageWidth $source.Width -ImageHeight $source.Height -Padding $padding
+    $compactBounds = Get-VisibleBounds -Bitmap $source -AlphaThreshold 32
+    $compactPadding = [int][Math]::Round([Math]::Max($source.Width, $source.Height) * 0.03)
+    $compactCrop = Get-SquareCrop -Bounds $compactBounds -ImageWidth $source.Width -ImageHeight $source.Height -Padding $compactPadding
+
+    $master = New-ResizedIconBitmap -Source $source -SourceRectangle $crop -Size 1024
+    try {
+        $master.Save($pngPath, [System.Drawing.Imaging.ImageFormat]::Png)
+
+        $sizes = @(16, 20, 24, 32, 40, 48, 64, 128, 256)
+        $frames = @()
+        foreach ($size in $sizes) {
+            if ($size -le 48) {
+                $frameBitmap = New-ResizedIconBitmap -Source $source -SourceRectangle $compactCrop -Size $size
+            }
+            else {
+                $frameBitmap = New-ResizedIconBitmap -Source $master -SourceRectangle ([System.Drawing.Rectangle]::new(0, 0, 1024, 1024)) -Size $size
+            }
+            try {
+                $memory = New-Object System.IO.MemoryStream
+                $frameBitmap.Save($memory, [System.Drawing.Imaging.ImageFormat]::Png)
+                $frames += ,@($size, $memory.ToArray())
+                $memory.Dispose()
+            }
+            finally {
+                $frameBitmap.Dispose()
+            }
+        }
+
+        $stream = New-Object System.IO.FileStream($icoPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+        $writer = New-Object System.IO.BinaryWriter($stream)
+        try {
+            $writer.Write([uint16]0)
+            $writer.Write([uint16]1)
+            $writer.Write([uint16]$frames.Count)
+
+            $offset = 6 + (16 * $frames.Count)
+            foreach ($frame in $frames) {
+                $size = [int]$frame[0]
+                $bytes = [byte[]]$frame[1]
+                $dimension = if ($size -eq 256) { [byte]0 } else { [byte]$size }
+                $writer.Write($dimension)
+                $writer.Write($dimension)
+                $writer.Write([byte]0)
+                $writer.Write([byte]0)
+                $writer.Write([uint16]1)
+                $writer.Write([uint16]32)
+                $writer.Write([uint32]$bytes.Length)
+                $writer.Write([uint32]$offset)
+                $offset += $bytes.Length
+            }
+
+            foreach ($frame in $frames) {
+                $writer.Write([byte[]]$frame[1])
+            }
+        }
+        finally {
+            $writer.Dispose()
+            $stream.Dispose()
+        }
+    }
+    finally {
+        $master.Dispose()
+    }
+}
+finally {
+    $source.Dispose()
+}
+
+Write-Output "Icon source: $SourcePath"
+Write-Output "Optical crop: $($crop.X),$($crop.Y) $($crop.Width)x$($crop.Height)"
+Write-Output "Small-size crop: $($compactCrop.X),$($compactCrop.Y) $($compactCrop.Width)x$($compactCrop.Height)"
+Write-Output "PNG created: $pngPath"
+Write-Output "ICO created: $icoPath ($($sizes -join ', ')px)"

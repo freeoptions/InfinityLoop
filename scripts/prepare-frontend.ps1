@@ -12,6 +12,8 @@ foreach ($fileName in @('index.html', 'script.js', 'style.css', 'backgrounds.js'
     Copy-Item -LiteralPath (Join-Path $projectRoot $fileName) -Destination (Join-Path $frontendRoot $fileName) -Force
 }
 
+Copy-Item -LiteralPath (Join-Path $projectRoot 'app-icon.png') -Destination (Join-Path $frontendRoot 'app-icon.png') -Force
+
 if (Test-Path -LiteralPath $backgroundSource) {
     Get-ChildItem -LiteralPath $backgroundSource -Force | Copy-Item -Destination $backgroundTarget -Recurse -Force
 }

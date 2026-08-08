@@ -1145,6 +1145,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_libmpv::init())
         .setup(|app| {
+            #[cfg(windows)]
+            {
+                const WINDOW_ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
+                if let Some(window) = app.get_webview_window("main") {
+                    if let Ok(icon) = tauri::image::Image::from_bytes(WINDOW_ICON_BYTES) {
+                        window.set_icon(icon)?;
+                    }
+                }
+            }
             build_tray(app)?;
             Ok(())
         })
