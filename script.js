@@ -138,7 +138,8 @@ const desktopState = {
     lastProgressPaint: 0,
     navigationRequest: 0,
     endHandled: false,
-    navigationChain: Promise.resolve()
+    navigationChain: Promise.resolve(),
+    playbackLogChain: Promise.resolve()
 };
 
 function invokeDesktop(command, args = {}) {
@@ -146,6 +147,51 @@ function invokeDesktop(command, args = {}) {
         return Promise.reject(new Error('当前不是 Windows 桌面模式'));
     }
     return window.__TAURI__.core.invoke(command, args);
+}
+
+function describePlaybackFile(path = '') {
+    const video = state.playlist[state.currentIndex];
+    const filePath = String(path || video?.path || desktopState.filename || '');
+    const name = String(video?.name || filePath.split(/[\\/]/).pop() || '');
+    const extension = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
+    return {
+        path: filePath,
+        name,
+        extension,
+        size: Number(video?.size) || 0,
+        lastModified: Number(video?.lastModified) || 0
+    };
+}
+
+function queuePlaybackLog(event, details = {}, path = '') {
+    if (!isDesktopApp) return;
+
+    const entry = {
+        time: new Date().toISOString(),
+        event,
+        mode: desktopState.mode,
+        index: state.currentIndex,
+        total: state.playlist.length,
+        requestId: desktopState.navigationRequest,
+        file: describePlaybackFile(path),
+        ...details
+    };
+
+    let message;
+    try {
+        message = JSON.stringify(entry);
+    } catch (error) {
+        message = JSON.stringify({
+            time: new Date().toISOString(),
+            event: 'diagnostic-log-serialization-error',
+            error: String(error)
+        });
+    }
+
+    desktopState.playbackLogChain = desktopState.playbackLogChain
+        .catch(() => {})
+        .then(() => invokeDesktop('write_playback_log', { message }))
+        .catch(error => console.debug('写入播放器诊断日志失败:', error));
 }
 
 function sendDesktopCommand(command) {
@@ -167,6 +213,10 @@ function sendDesktopCommand(command) {
         : { name, args, windowLabel: MPV_WINDOW_LABEL };
     return invokeDesktop(invokeName, invokeArgs).catch(error => {
         console.error('mpv 命令失败:', command, error);
+        queuePlaybackLog('command-error', {
+            command,
+            error: String(error)
+        });
         if (desktopState.lastError !== String(error)) {
             desktopState.lastError = String(error);
             showToast('播放器内核通信失败');
@@ -259,6 +309,9 @@ const desktopPlayer = {
     },
     loadFile(path) {
         if (!desktopState.started || !path) return Promise.resolve();
+        queuePlaybackLog('load-request', {
+            command: ['loadfile', 'replace']
+        }, path);
         return sendDesktopCommand(['loadfile', path, 'replace']);
     },
 };
@@ -456,6 +509,7 @@ async function setupDesktopBridge() {
     if (!isDesktopApp || desktopState.eventReady) return desktopState.eventReady;
     const listen = window.__TAURI__.event?.listen;
     if (!listen) {
+        queuePlaybackLog('event-bridge-unavailable');
         showToast('桌面事件桥接不可用');
         return;
     }
@@ -463,19 +517,42 @@ async function setupDesktopBridge() {
     desktopState.eventReady = Promise.all([
         listen(`mpv-event-${MPV_WINDOW_LABEL}`, event => {
             const payload = getTauriPayload(event);
+            const eventName = payload?.event;
             if (payload?.event === 'property-change') {
+                if ([
+                    'filename',
+                    'video-codec',
+                    'video-format',
+                    'hwdec-current',
+                    'video-params/w',
+                    'video-params/h',
+                    'video-out-params/dw',
+                    'video-out-params/dh'
+                ].includes(payload.name)) {
+                    queuePlaybackLog('property-change', {
+                        property: payload.name,
+                        value: payload.data
+                    }, payload.name === 'filename' ? String(payload.data || '') : '');
+                }
                 handleDesktopProperty({ name: payload.name, value: payload.data });
             } else if (payload?.event === 'client-message') {
                 handleDesktopInput(payload.args);
             } else if (payload?.event === 'backend-exited' && desktopState.started) {
+                queuePlaybackLog('backend-exited', { mpvEvent: payload });
                 desktopState.started = false;
                 showToast('播放器内核已退出');
             } else if (
                 payload?.event === 'end-file'
                 && isNaturalDesktopEnd(payload?.reason)
             ) {
+                queuePlaybackLog('end-file', { mpvEvent: payload });
                 scheduleDesktopNext();
             } else if (payload?.event === 'end-file' && payload?.reason === 'error') {
+                queuePlaybackLog('playback-error', {
+                    errorCode: payload.error,
+                    errorDescription: describeMpvError(payload.error),
+                    mpvEvent: payload
+                });
                 const errorDetail = payload.error !== undefined
                     ? `：${describeMpvError(payload.error)}`
                     : '';
@@ -493,6 +570,11 @@ async function setupDesktopBridge() {
                         }
                     }, 0);
                 }
+            }
+
+            if (eventName && eventName !== 'property-change' && eventName !== 'client-message'
+                && eventName !== 'backend-exited' && eventName !== 'end-file') {
+                queuePlaybackLog('mpv-event', { mpvEvent: payload });
             }
         }),
         listen('folder-scan-progress', event => {
@@ -516,49 +598,59 @@ async function ensureDesktopPlayer() {
     if (desktopState.started) return;
     const mpvLogPath = await invokeDesktop('get_mpv_log_path')
         .catch(() => 'InfinityLoop-mpv.log');
-    await invokeDesktop('plugin:libmpv|init', {
-        windowLabel: MPV_WINDOW_LABEL,
-        mpvConfig: {
-            initialOptions: {
-                vo: 'gpu-next',
-                hwdec: 'auto-safe',
-                'keep-open': 'yes',
-                'force-window': 'yes',
-                keepaspect: 'yes',
-                'video-unscaled': 'no',
-                panscan: 0,
-                'video-zoom': 0,
-                'video-pan-x': 0,
-                'video-pan-y': 0,
-                // 保持软件默认听感，不使用音频滤镜，避免不同视频出现爆音或失真。
-                volume: 120,
-                'volume-max': 200,
-                'input-cursor-passthrough': 'yes',
-                'input-vo-keyboard': 'no',
-                'input-default-bindings': 'no',
-                osc: 'no',
-                'osd-level': 0,
-                'log-file': mpvLogPath,
-                'msg-level': 'all=info'
-            },
-            observedProperties: {
-                pause: 'flag',
-                'time-pos': 'double',
-                duration: 'double',
-                'eof-reached': 'flag',
-                filename: 'string',
-                'video-codec': 'string',
-                'video-format': 'string',
-                'hwdec-current': 'string',
-                'video-params/w': 'int64',
-                'video-params/h': 'int64',
-                'video-out-params/dw': 'int64',
-                'video-out-params/dh': 'int64',
-                'track-list': 'node'
+    queuePlaybackLog('player-init-request', { mpvLogPath });
+    try {
+        await invokeDesktop('plugin:libmpv|init', {
+            windowLabel: MPV_WINDOW_LABEL,
+            mpvConfig: {
+                initialOptions: {
+                    vo: 'gpu-next',
+                    hwdec: 'auto-safe',
+                    'keep-open': 'yes',
+                    'force-window': 'yes',
+                    keepaspect: 'yes',
+                    'video-unscaled': 'no',
+                    panscan: 0,
+                    'video-zoom': 0,
+                    'video-pan-x': 0,
+                    'video-pan-y': 0,
+                    // 保持软件默认听感，不使用音频滤镜，避免不同视频出现爆音或失真。
+                    volume: 120,
+                    'volume-max': 200,
+                    'input-cursor-passthrough': 'yes',
+                    'input-vo-keyboard': 'no',
+                    'input-default-bindings': 'no',
+                    osc: 'no',
+                    'osd-level': 0,
+                    'log-file': mpvLogPath,
+                    'msg-level': 'all=info'
+                },
+                observedProperties: {
+                    pause: 'flag',
+                    'time-pos': 'double',
+                    duration: 'double',
+                    'eof-reached': 'flag',
+                    filename: 'string',
+                    'video-codec': 'string',
+                    'video-format': 'string',
+                    'hwdec-current': 'string',
+                    'video-params/w': 'int64',
+                    'video-params/h': 'int64',
+                    'video-out-params/dw': 'int64',
+                    'video-out-params/dh': 'int64',
+                    'track-list': 'node'
+                }
             }
-        }
-    });
-    desktopState.started = true;
+        });
+        desktopState.started = true;
+        queuePlaybackLog('player-init-success', { mpvLogPath });
+    } catch (error) {
+        queuePlaybackLog('player-init-error', {
+            error: String(error),
+            mpvLogPath
+        });
+        throw error;
+    }
 }
 
 /*

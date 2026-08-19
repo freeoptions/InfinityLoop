@@ -1,7 +1,10 @@
 use serde::Serialize;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, Window};
 
 /*
@@ -209,6 +212,40 @@ struct ScanProgress {
     candidates: usize,
     current_path: String,
     finished: bool,
+}
+
+static PLAYBACK_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn playback_log_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("InfinityLoop-mpv.log"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("InfinityLoop-mpv.log"))
+}
+
+fn append_playback_log(message: &str) -> Result<(), String> {
+    let lock = PLAYBACK_LOG_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().map_err(|_| "播放器日志锁不可用".to_string())?;
+    let path = playback_log_path();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("打开播放器日志失败：{} ({error})", path.display()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    writeln!(file, "[{timestamp}] {message}")
+        .map_err(|error| format!("写入播放器日志失败：{error}"))
+}
+
+#[tauri::command]
+fn write_playback_log(message: String) -> Result<(), String> {
+    append_playback_log(&message)
 }
 
 #[tauri::command]
@@ -804,12 +841,7 @@ fn set_fullscreen(window: Window, fullscreen: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn get_mpv_log_path() -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|error| format!("获取程序路径失败：{error}"))?;
-    let parent = exe.parent().ok_or_else(|| "获取程序目录失败".to_string())?;
-    Ok(parent
-        .join("InfinityLoop-mpv.log")
-        .to_string_lossy()
-        .into_owned())
+    Ok(playback_log_path().to_string_lossy().into_owned())
 }
 
 /*
@@ -1172,6 +1204,7 @@ pub fn run() {
             send_to_recycle_bin,
             move_file_to_folder,
             get_mpv_log_path,
+            write_playback_log,
             set_fullscreen
         ])
         .run(tauri::generate_context!())
