@@ -843,7 +843,9 @@ const bgState = {
     intervalId: null,
     bgLayer1: null,
     bgLayer2: null,
-    currentLayer: 1
+    currentLayer: 1,
+    imageCache: new Map(),
+    rotationRequest: 0
 };
 
 const COMMON_VIDEO_FOLDERS_KEY = 'commonVideoFolders';
@@ -854,8 +856,11 @@ const MOVE_FOLDER_KEY = 'moveFolder';
 const MOVE_FOLDERS_KEY = 'moveFolders';
 const FOLDER_GROUP_COLLAPSE_KEY = 'folderGroupCollapse';
 const DEFAULT_WALLPAPER_INTERVAL_SECONDS = 12;
+const MAX_BACKGROUND_IMAGE_CACHE = 2;
+const BACKGROUND_IDLE_TIMEOUT_MS = 1200;
 let pendingFolderEditor = null;
 let activeMoveTargetMenu = null;
+let dbReadyPromise = null;
 
 function readStoredJson(key, fallback) {
     try {
@@ -1278,6 +1283,15 @@ function wallpaperFilesToUrls(files) {
         : [];
 }
 
+function compactWallpaperFiles(files) {
+    if (!Array.isArray(files)) return [];
+
+    // 清单只需要保留路径；尺寸、修改时间等信息对轮播没有用，避免 IndexedDB 缓存膨胀。
+    return files
+        .map(file => ({ path: String(file?.path || '') }))
+        .filter(file => file.path);
+}
+
 async function getWallpaperCache(path) {
     if (!isDesktopApp) return null;
     if (!window.db) await initDB();
@@ -1302,7 +1316,7 @@ async function saveWallpaperCache(path, files) {
         const request = transaction.objectStore(WALLPAPER_CACHE_STORE_NAME).put({
             id: 'active',
             folderPath: path,
-            files,
+            files: compactWallpaperFiles(files),
             updatedAt: Date.now()
         });
         request.onsuccess = () => resolve();
@@ -1420,9 +1434,16 @@ function startBgRotation() {
         clearInterval(bgState.intervalId);
     }
 
-    // 设置初始背景（直接显示，不渐变）
+    // 设置初始背景（直接显示，不渐变）。图片本身通过受控缓存异步解码。
     const initialBg = bgState.images[bgState.currentIndex];
-    bgState.bgLayer1.style.backgroundImage = `url('${initialBg}')`;
+    bgState.currentLayer = 1;
+    bgState.rotationRequest += 1;
+    const rotationRequest = bgState.rotationRequest;
+    preloadBackgroundImage(initialBg).then(() => {
+        if (rotationRequest === bgState.rotationRequest && bgState.bgLayer1) {
+            bgState.bgLayer1.style.backgroundImage = `url('${initialBg}')`;
+        }
+    });
 
     // 按设置的间隔随机切换，避免重复扫描壁纸目录。
     bgState.intervalId = setInterval(() => {
@@ -1433,6 +1454,8 @@ function startBgRotation() {
             attempts++;
         } while (newIndex === bgState.currentIndex && bgState.images.length > 1 && attempts < 10);
         bgState.currentIndex = newIndex;
+        // 提前解码下一张，切换时直接复用；缓存上限为 2 张，避免长时间轮播持续占用内存。
+        preloadBackgroundImage(bgState.images[newIndex]);
         updateBgImage();
     }, getWallpaperIntervalSeconds() * 1000);
 }
@@ -1451,6 +1474,34 @@ function setBackgroundActive(active) {
     }
 }
 
+function preloadBackgroundImage(url) {
+    if (!url) return Promise.resolve(null);
+
+    const cached = bgState.imageCache.get(url);
+    if (cached) {
+        // LRU：重新访问的图片移动到 Map 末尾。
+        bgState.imageCache.delete(url);
+        bgState.imageCache.set(url, cached);
+        return cached;
+    }
+
+    const imagePromise = new Promise(resolve => {
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = url;
+    });
+    bgState.imageCache.set(url, imagePromise);
+
+    while (bgState.imageCache.size > MAX_BACKGROUND_IMAGE_CACHE) {
+        const oldestUrl = bgState.imageCache.keys().next().value;
+        bgState.imageCache.delete(oldestUrl);
+    }
+
+    return imagePromise;
+}
+
 // 更新背景图（渐隐→切换→渐显）
 function updateBgImage() {
     if (bgState.images.length === 0) return;
@@ -1461,10 +1512,9 @@ function updateBgImage() {
     const currentBgLayer = bgState.currentLayer === 1 ? bgState.bgLayer1 : bgState.bgLayer2;
     const nextBgLayer = bgState.currentLayer === 1 ? bgState.bgLayer2 : bgState.bgLayer1;
 
-    // 预加载新图片
-    const img = new Image();
-    img.decoding = 'async';
-    img.onload = () => {
+    const rotationRequest = ++bgState.rotationRequest;
+    preloadBackgroundImage(currentBg).then(img => {
+        if (!img || rotationRequest !== bgState.rotationRequest) return;
         // 1. 设置下一个背景层的图片（但在后面，暂时看不见）
         nextBgLayer.style.backgroundImage = `url('${currentBg}')`;
         nextBgLayer.classList.remove('fade-out');
@@ -1476,8 +1526,7 @@ function updateBgImage() {
 
         // 3. 切换当前层标记
         bgState.currentLayer = bgState.currentLayer === 1 ? 2 : 1;
-    };
-    img.src = currentBg;
+    });
 }
 
 // 初始化背景层
@@ -1507,9 +1556,21 @@ function init() {
     renderCommonVideoFolders();
     loadWallpaperIntervalOption();
     renderMoveFolderSummary();
-    loadBackgroundImages().catch(error => console.error('加载壁纸失败:', error));
+    scheduleBackgroundLoad();
     loadIncludeSubfoldersOption();
     console.log('✅ 播放器初始化完成');
+}
+
+function scheduleBackgroundLoad() {
+    const load = () => loadBackgroundImages()
+        .catch(error => console.error('加载壁纸失败:', error));
+
+    // 壁纸不参与首屏交互，优先让首页完成布局、按钮绑定和窗口响应。
+    if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(load, { timeout: BACKGROUND_IDLE_TIMEOUT_MS });
+    } else {
+        window.setTimeout(load, 350);
+    }
 }
 
 // 加载上次使用的文件夹
@@ -1599,16 +1660,16 @@ function initDefaultPresets() {
 
 // 初始化 IndexedDB
 function initDB() {
-    return new Promise((resolve, reject) => {
-        // 先清理旧的共享数据库
-        const oldDbName = 'VideoPlayerDB'; // 清理旧版本遗留数据库
-        const deleteReq = indexedDB.deleteDatabase(oldDbName);
-        deleteReq.onsuccess = () => console.log('✅ 已清理旧数据库');
-        deleteReq.onerror = () => {}; // 忽略删除失败
+    if (window.db) return Promise.resolve(window.db);
+    if (dbReadyPromise) return dbReadyPromise;
 
+    dbReadyPromise = new Promise((resolve, reject) => {
         const request = indexedDB.open(DB_NAME, DB_VERSION);
 
-        request.onerror = () => reject(request.error);
+        request.onerror = () => {
+            dbReadyPromise = null;
+            reject(request.error);
+        };
         request.onsuccess = () => {
             window.db = request.result;
             resolve(request.result);
@@ -1627,6 +1688,8 @@ function initDB() {
             }
         };
     });
+
+    return dbReadyPromise;
 }
 
 // 保存路径到 IndexedDB
