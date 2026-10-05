@@ -1,6 +1,6 @@
 ﻿# InfinityLoop 项目专属规则
 
-通用规则见：`E:\@imFile-Download\AI-Useful-Prompt\通用开发工作规则.md`。
+本项目继承 Codex 已加载的全局 `AGENTS.md`（本机：`C:\Users\freez\.codex\AGENTS.md`）；以下保留项目专属规则。
 
 - 本项目是 Tauri 桌面应用，前端入口在根目录，Rust/Tauri 代码在 `src-tauri`，背景资源位于 `BackGroudPics`。
 - 开发命令为 `npm run dev`；获得构建授权后使用项目已有的 `npm run build:exe`，该脚本会调用 `scripts/build-release.ps1`。
