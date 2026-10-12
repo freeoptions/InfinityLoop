@@ -14,7 +14,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-ico"] }
 tauri-plugin-libmpv = "0.3.2"
+tauri-plugin-single-instance = "2"
 rfd = "0.15"
-windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_System_LibraryLoader"] }
+
+[patch.crates-io]
+tauri-plugin-libmpv = { path = "../vendor/tauri-plugin-libmpv" }

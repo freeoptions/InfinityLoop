@@ -7,6 +7,50 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, Window};
 
+mod seek_preview;
+mod playback;
+mod startup;
+
+#[tauri::command]
+async fn get_seek_preview(app: AppHandle, path: String, seconds: f64) -> Result<Vec<u8>, String> {
+    seek_preview::validate_time(seconds)?;
+    #[cfg(windows)]
+    {
+        let guard = seek_preview::RequestGuard::acquire()?;
+        let token = seek_preview::generation();
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                candidates.push(parent.join("lib/libmpv-2.dll"));
+            }
+        }
+        if let Ok(resources) = app.path().resource_dir() {
+            candidates.push(resources.join("lib/libmpv-2.dll"));
+        }
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib/libmpv-2.dll"));
+        let library = candidates
+            .into_iter()
+            .find(|path| path.is_file())
+            .ok_or("找不到预览播放内核")?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let _guard = guard;
+            seek_preview::capture(library, path, seconds, token)
+        })
+        .await
+        .map_err(|error| format!("预览任务失败：{error}"))?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, path);
+        Err("当前平台不支持原生画面预览".to_string())
+    }
+}
+
+#[tauri::command]
+fn cancel_seek_preview() {
+    seek_preview::cancel();
+}
+
 /*
 pub struct AppState {
     player: Mutex<Option<MpvController>>,
@@ -1107,6 +1151,7 @@ fn destroy_native_surface(_surface: isize) {}
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
+        let _ = window.unminimize();
         let _ = window.set_focus();
     }
 }
@@ -1121,6 +1166,27 @@ fn cleanup_tray(app: &AppHandle) {
         let _ = tray.set_visible(false);
         let _ = tray.set_icon(None);
     }
+}
+
+static EXIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn request_exit(app: &AppHandle) {
+    if EXIT_REQUESTED.swap(true, std::sync::atomic::Ordering::SeqCst) { return }
+    let _ = app.emit("save-before-exit", ());
+    let handle = app.clone();
+    // 前端保存完成后立即退出；WebView 无响应时仍有有界退出路径。
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        finish_exit(handle);
+    });
+}
+
+#[tauri::command]
+fn finish_exit(app: AppHandle) {
+    if !EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) { return }
+    cleanup_tray(&app);
+    stop_player(&app);
+    app.exit(0);
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
@@ -1138,9 +1204,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
             "quit" => {
-                stop_player(app);
-                cleanup_tray(app);
-                app.exit(0);
+                request_exit(app);
             }
             _ => {}
         })
@@ -1174,9 +1238,19 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 }
 
 pub fn run() {
+    startup::begin();
+    startup::record("process-entry", None);
     tauri::Builder::default()
+        .manage(playback::PlaybackGate::default())
+        .manage(playback::MediaEvents::default())
+        // 必须先拦截重复启动，避免初始化播放器或创建第二个托盘图标。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_libmpv::init())
         .setup(|app| {
+            startup::record("native-setup", None);
+            playback::install(app.handle());
             #[cfg(windows)]
             {
                 const WINDOW_ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
@@ -1187,6 +1261,7 @@ pub fn run() {
                 }
             }
             build_tray(app)?;
+            startup::record("window-tray-ready", None);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1205,7 +1280,16 @@ pub fn run() {
             move_file_to_folder,
             get_mpv_log_path,
             write_playback_log,
-            set_fullscreen
+            set_fullscreen,
+            get_seek_preview,
+            cancel_seek_preview,
+            finish_exit,
+            startup::record_startup_stage,
+            playback::playback_load,
+            playback::playback_snapshot,
+            playback::playback_failure,
+            playback::playback_file_metadata,
+            playback::playback_set
         ])
         .run(tauri::generate_context!())
         .expect("运行 InfinityLoop 失败");

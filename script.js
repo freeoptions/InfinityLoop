@@ -86,7 +86,6 @@ const elements = {
     infoSize: document.getElementById('info-size'),
     tipText: document.getElementById('tip-text'),
     addVideoFolder: document.getElementById('add-video-folder'),
-    addVideoGroup: document.getElementById('add-video-group'),
     commonVideoFolders: document.getElementById('common-video-folders'),
     configureWallpaperFolder: document.getElementById('configure-wallpaper-folder'),
     wallpaperFolderSummary: document.getElementById('wallpaper-folder-summary'),
@@ -101,8 +100,16 @@ const elements = {
     folderAliasPath: document.getElementById('folder-alias-path'),
     folderAliasInputLabel: document.getElementById('folder-alias-input-label'),
     folderAliasInput: document.getElementById('folder-alias-input'),
+    folderAliasNote: document.getElementById('folder-alias-note'),
+    folderAliasNoteLabel: document.getElementById('folder-alias-note-label'),
     folderAliasGroupLabel: document.getElementById('folder-alias-group-label'),
     folderAliasGroup: document.getElementById('folder-alias-group'),
+    folderAliasGroupControls: document.getElementById('folder-alias-group-controls'),
+    folderAliasCreateGroup: document.getElementById('folder-alias-create-group'),
+    folderAliasNewGroupFields: document.getElementById('folder-alias-new-group-fields'),
+    folderAliasNewGroupName: document.getElementById('folder-alias-new-group-name'),
+    folderAliasNewGroupError: document.getElementById('folder-alias-new-group-error'),
+    folderAliasGroupHint: document.getElementById('folder-alias-group-hint'),
     folderAliasClose: document.getElementById('folder-alias-close'),
     folderAliasCancel: document.getElementById('folder-alias-cancel'),
     folderAliasConfirm: document.getElementById('folder-alias-confirm')
@@ -139,8 +146,358 @@ const desktopState = {
     navigationRequest: 0,
     endHandled: false,
     navigationChain: Promise.resolve(),
+    destroyPromise: Promise.resolve(),
     playbackLogChain: Promise.resolve()
 };
+
+const playbackMemory = InfinityPlaybackMemory.create(storage, { onError: () => console.warn('播放记录存储暂不可用') });
+const playbackSession = {
+    active: null, pending: null, generation: 0, pollBusy: false, segmentChain: Promise.resolve(),
+    speed: InfinityPlaybackMemory.SPEEDS.includes(Number(readStoredJson('playbackSpeed', 1))) ? Number(readStoredJson('playbackSpeed', 1)) : 1
+};
+const playbackUi = Object.fromEntries(['playback-speed', 'segment-toggle', 'segment-quick-play', 'segment-panel', 'segment-a', 'segment-b', 'segment-error',
+    'segment-loop', 'segment-play', 'segment-stop', 'segment-clear'].map(id => [id, document.getElementById(id)]));
+
+const startupStages = new Set();
+function recordStartupStage(stage) {
+    if (startupStages.has(stage)) return;
+    startupStages.add(stage);
+    const frontendMs = performance.now();
+    if (isDesktopApp) invokeDesktop('record_startup_stage', { stage, frontendMs }).catch(() => {});
+    else console.debug(`阶段 ${stage}: ${frontendMs.toFixed(1)}ms`);
+}
+
+function videoIdentity(file) {
+    return InfinityPlaybackMemory.identity(file, typeof state.folderHandle === 'string' ? state.folderHandle : state.folderHandle?.name || storage.getItem('lastFolderName') || 'selected-folder');
+}
+
+function isActiveSession(session) {
+    return Boolean(session && playbackSession.active === session && session.generation === playbackSession.generation);
+}
+
+function saveSession(session, force = false, completed = false) {
+    if (!session || !session.ready) return;
+    const position = session.element ? session.element.currentTime : session.position;
+    const duration = session.element ? session.element.duration : session.duration;
+    const done = completed || session.completed === true;
+    const signature = `${position}:${duration}:${done}`;
+    if (session.lastSavedSignature === signature) { if (force) playbackMemory.flush(true); return; }
+    session.lastSavedSignature = signature;
+    playbackMemory.update(session.key, session.file, position, duration, done, force);
+}
+
+async function captureDesktopSession(session, force = true) {
+    if (!session || !desktopState.started) return;
+    try {
+        const snapshot = await invokeDesktop('playback_snapshot');
+        if (snapshot && snapshot.generation === session.generation && snapshot.mediaId === session.mediaId
+            && `desktop:${snapshot.path}` === session.key && Number.isFinite(snapshot.position)) {
+            session.position = snapshot.position; session.duration = snapshot.duration;
+            if (snapshot.eof && !session.segmentMode) session.completed = true;
+        } else if (snapshot?.ended && snapshot.generation === session.generation && snapshot.mediaId === session.mediaId && !session.segmentMode) {
+            session.completed = true;
+        }
+    } catch (_) { /* 保存失败不能拦住切换或退出。 */ }
+    saveSession(session, force);
+}
+
+function leavePlaybackSession() {
+    const session = playbackSession.active;
+    saveSession(session, true);
+    session?.cancelSegmentFrame?.();
+    if (session?.element) {
+        session.element.pause(); session.element.loop = state.options.loopSingle;
+    }
+    playbackSession.active = null;
+    playbackSession.pending = null;
+    playbackSession.generation += 1;
+    playbackUi['segment-panel'].hidden = true;
+    renderSegment();
+    return session;
+}
+
+function createPlaybackSession(file, generation, element = null) {
+    const key = videoIdentity(file);
+    const record = playbackMemory.get(key, file);
+    return { file, key, generation, element, position: 0, duration: NaN, mediaId: null, ready: false,
+        completed: false, segment: record?.segment ? { ...record.segment } : null, segmentMode: null };
+}
+
+async function setSessionProperty(session, name, value) {
+    if (!isActiveSession(session)) return false;
+    if (session.element) {
+        const map = { 'time-pos': 'currentTime', pause: 'paused', speed: 'playbackRate', 'loop-file': 'loop' };
+        if (name === 'pause') value ? session.element.pause() : await session.element.play();
+        else if (map[name]) session.element[map[name]] = name === 'loop-file' ? value === 'inf' : value;
+        return isActiveSession(session);
+    }
+    const changed = await invokeDesktop('playback_set', { generation: session.generation, mediaId: session.mediaId, name, value });
+    return changed && isActiveSession(session);
+}
+
+async function pollDesktopPlayback() {
+    if (!desktopState.started || playbackSession.pollBusy || (!playbackSession.pending && !playbackSession.active)) return;
+    playbackSession.pollBusy = true;
+    try {
+        const expected = playbackSession.pending || playbackSession.active;
+        const snapshot = await invokeDesktop('playback_snapshot');
+        if (!snapshot || snapshot.generation !== playbackSession.generation || snapshot.generation !== expected.generation
+            || `desktop:${snapshot.path}` !== expected.key) return;
+        if (snapshot.ended) {
+            if (!isActiveSession(expected) || expected.mediaId !== snapshot.mediaId) return;
+            if (expected.segmentMode) { if (expected.segmentMode === 'once') finishSegmentOnce(expected); return; }
+            expected.completed = true; saveSession(expected, true, true); scheduleDesktopNext();
+            return;
+        }
+        if (!Number.isFinite(snapshot.position)) return;
+        snapshot.duration = Number.isFinite(snapshot.duration) && snapshot.duration > 0 ? snapshot.duration : NaN;
+        if (playbackSession.pending === expected) {
+            expected.mediaId = snapshot.mediaId; expected.ready = true;
+            expected.duration = snapshot.duration;
+            playbackSession.active = expected; playbackSession.pending = null;
+            desktopState.endHandled = false;
+            if (expected.segment && Number.isFinite(snapshot.duration) && !InfinityPlaybackMemory.validSegment(expected.segment, snapshot.duration)) {
+                expected.segment = null; playbackMemory.setSegment(expected.key, expected.file, null, snapshot.duration);
+            }
+            renderSegment();
+            recordStartupStage('first-media-ready');
+        }
+        if (!isActiveSession(expected) || snapshot.mediaId !== expected.mediaId) return;
+        const durationChanged = !Object.is(expected.duration, snapshot.duration);
+        expected.position = snapshot.position; expected.duration = snapshot.duration;
+        if (expected.segment && Number.isFinite(snapshot.duration) && !InfinityPlaybackMemory.validSegment(expected.segment, snapshot.duration)) {
+            expected.segment = null;
+            playbackMemory.setSegment(expected.key, expected.file, null, snapshot.duration);
+            renderSegment();
+        } else if (durationChanged) updateSegmentAvailability(expected);
+        desktopState.currentTime = snapshot.position; desktopState.duration = snapshot.duration;
+        desktopState.paused = snapshot.paused === true;
+        state.isPlaying = !desktopState.paused;
+        updateProgress(desktopPlayer); updatePlayPauseButton();
+        if (InfinityPlaybackMemory.SPEEDS.includes(snapshot.speed)) playbackUi['playback-speed'].value = String(snapshot.speed);
+        saveSession(expected, desktopState.paused);
+        if (expected.segmentMode) {
+            if (expected.segmentMode === 'once' && (snapshot.eof || snapshot.position >= expected.segment.b)) finishSegmentOnce(expected);
+        } else if (snapshot.eof) {
+            expected.completed = true;
+            saveSession(expected, true, true);
+            scheduleDesktopNext();
+        }
+    } catch (_) { /* 初始化、销毁或短暂属性不可用时等待下一个快照。 */ }
+    finally { playbackSession.pollBusy = false; }
+}
+
+function preciseTime(seconds) {
+    if (!Number.isFinite(seconds)) return '';
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}:${(seconds % 60).toFixed(2).padStart(5, '0')}`;
+}
+
+function parseSegmentTime(text) {
+    const value = String(text).trim();
+    if (!/^\d+(?:\.\d+)?$/.test(value) && !/^\d+:\d{1,2}(?:\.\d+)?$/.test(value)) return NaN;
+    if (!value.includes(':')) return Number(value);
+    const [minutes, seconds] = value.split(':').map(Number);
+    return seconds < 60 ? minutes * 60 + seconds : NaN;
+}
+
+function renderSegment() {
+    const session = playbackSession.active;
+    const segment = session?.segment;
+    playbackUi['segment-toggle'].textContent = segment ? `${formatTime(segment.a)}–${formatTime(segment.b)}` : '设置区间';
+    playbackUi['segment-toggle'].setAttribute('aria-pressed', String(Boolean(session?.segmentMode)));
+    playbackUi['segment-toggle'].setAttribute('aria-expanded', String(!playbackUi['segment-panel'].hidden));
+    playbackUi['segment-quick-play'].hidden = !segment;
+    playbackUi['segment-toggle'].disabled = !session?.ready;
+    playbackUi['playback-speed'].disabled = !session?.ready;
+    playbackUi['segment-a'].value = segment ? preciseTime(segment.a) : '';
+    playbackUi['segment-b'].value = segment ? preciseTime(segment.b) : '';
+    playbackUi['segment-loop'].checked = session?.segmentMode === 'loop';
+    playbackUi['segment-stop'].hidden = !session?.segmentMode;
+    updateSegmentAvailability(session);
+    playbackUi['segment-error'].textContent = '';
+}
+
+function updateSegmentAvailability(session) {
+    playbackUi['segment-play'].disabled = !session?.segment || !Number.isFinite(session?.duration);
+    playbackUi['segment-quick-play'].disabled = playbackUi['segment-play'].disabled;
+    playbackUi['segment-loop'].disabled = playbackUi['segment-play'].disabled;
+}
+
+function queueSegmentAction(action) {
+    const session = playbackSession.active;
+    playbackSession.segmentChain = playbackSession.segmentChain.catch(() => {}).then(async () => {
+        if (!isActiveSession(session)) return;
+        await action(session);
+    }).catch(async error => {
+        if (isActiveSession(session)) {
+            await resetSegmentMode(session).catch(() => {});
+            renderSegment();
+            playbackUi['segment-error'].textContent = '区间操作失败，请重试';
+        }
+        console.warn('区间操作失败:', error);
+    });
+    return playbackSession.segmentChain;
+}
+
+async function resetSegmentMode(session) {
+    if (!isActiveSession(session)) return;
+    session.cancelSegmentFrame?.();
+    if (!session.element) {
+        for (const [name, value] of [['ab-loop-a', 'no'], ['ab-loop-b', 'no'], ['end', 'none']]) {
+            if (!await setSessionProperty(session, name, value)) return;
+        }
+    }
+    if (!await setSessionProperty(session, 'loop-file', state.options.loopSingle ? 'inf' : 'no')) return;
+    session.segmentMode = null;
+    renderSegment();
+}
+
+async function startSegment(session, loop) {
+    if (!InfinityPlaybackMemory.validSegment(session.segment, session.duration)) return;
+    await resetSegmentMode(session);
+    if (!isActiveSession(session)) return;
+    if (!await setSessionProperty(session, 'loop-file', 'no')) return;
+    if (!session.element) {
+        if (loop) {
+            if (!await setSessionProperty(session, 'ab-loop-a', session.segment.a)) return;
+            if (!await setSessionProperty(session, 'ab-loop-b', session.segment.b)) return;
+        } else if (!await setSessionProperty(session, 'end', session.segment.b)) return;
+    }
+    session.segmentMode = loop ? 'loop' : 'once'; session.completed = false; session.segmentFinished = false;
+    if (!await setSessionProperty(session, 'time-pos', session.segment.a)) return;
+    await setSessionProperty(session, 'pause', false);
+    if (isActiveSession(session)) {
+        if (session.element) monitorBrowserSegment(session);
+        renderSegment(); saveSession(session, true);
+    }
+}
+
+function monitorBrowserSegment(session) {
+    session.cancelSegmentFrame?.();
+    const video = session.element;
+    const hasVideoCallback = typeof video.requestVideoFrameCallback === 'function';
+    let frame = 0;
+    session.cancelSegmentFrame = () => {
+        if (hasVideoCallback) video.cancelVideoFrameCallback?.(frame);
+        else cancelAnimationFrame(frame);
+        frame = 0;
+    };
+    const check = () => {
+        if (!isActiveSession(session) || !session.segmentMode || session.segmentFinished) return;
+        if (video.currentTime >= session.segment.b) {
+            if (session.segmentMode === 'loop') video.currentTime = session.segment.a;
+            else { finishSegmentOnce(session); return; }
+        }
+        frame = hasVideoCallback ? video.requestVideoFrameCallback(check) : requestAnimationFrame(check);
+    };
+    frame = hasVideoCallback ? video.requestVideoFrameCallback(check) : requestAnimationFrame(check);
+}
+
+function finishSegmentOnce(session) {
+    if (session.segmentFinishing || session.segmentFinished) return;
+    session.segmentFinishing = true;
+    queueSegmentAction(async active => {
+        if (active !== session || active.segmentMode !== 'once') return;
+        await setSessionProperty(active, 'pause', true);
+        if (!isActiveSession(active)) return;
+        if (active.element) active.element.currentTime = active.segment.b;
+        active.segmentFinished = true;
+        // 保留临时区间模式直到用户退出，防止 B 在片尾时触发自动下一首。
+        active.position = active.segment.b;
+        saveSession(active, true); renderSegment();
+    }).finally(() => { session.segmentFinishing = false; });
+}
+
+function saveSegmentDraft() {
+    const session = playbackSession.active;
+    if (!session?.ready) return;
+    if (!Number.isFinite(session.duration) || session.duration <= 0) {
+        playbackUi['segment-error'].textContent = '视频时长暂不可用，无法设置区间';
+        return;
+    }
+    const segment = { a: parseSegmentTime(playbackUi['segment-a'].value), b: parseSegmentTime(playbackUi['segment-b'].value) };
+    if (!InfinityPlaybackMemory.validSegment(segment, session.duration)) {
+        playbackUi['segment-error'].textContent = `请输入有效时间：0 ≤ 起点 < 终点 ≤ ${preciseTime(session.duration)}`;
+        return;
+    }
+    queueSegmentAction(async active => {
+        await resetSegmentMode(active);
+        if (!isActiveSession(active)) return;
+        active.segment = segment;
+        playbackMemory.setSegment(active.key, active.file, segment, active.duration);
+        renderSegment();
+    });
+}
+
+function activateBrowserSession(video, file) {
+    if (playbackSession.active?.element === video) return;
+    leavePlaybackSession();
+    const session = createPlaybackSession(file, playbackSession.generation, video);
+    session.duration = video.duration; session.ready = true;
+    playbackSession.active = session;
+    if (session.ready) {
+        try { video.currentTime = InfinityPlaybackMemory.resumePosition(playbackMemory.get(session.key, file), video.duration); } catch (_) { /* 不可 seek 的媒体继续正常播放。 */ }
+        video.playbackRate = playbackSession.speed; video.loop = state.options.loopSingle;
+        if (session.segment && Number.isFinite(video.duration) && !InfinityPlaybackMemory.validSegment(session.segment, video.duration)) {
+            session.segment = null; playbackMemory.setSegment(session.key, file, null, video.duration);
+        }
+    }
+    renderSegment();
+}
+
+function bindPlaybackFeatures() {
+    renderSegment();
+    playbackUi['playback-speed'].value = String(playbackSession.speed);
+    playbackUi['playback-speed'].addEventListener('change', async event => {
+        const speed = Number(event.target.value); const session = playbackSession.active;
+        if (!InfinityPlaybackMemory.SPEEDS.includes(speed)) return;
+        event.target.disabled = true;
+        try {
+            if (!await setSessionProperty(session, 'speed', speed)) return;
+            const actual = session.element ? session.element.playbackRate : (await invokeDesktop('playback_snapshot'))?.speed;
+            if (!isActiveSession(session) || actual !== speed) throw new Error('倍速未生效');
+            playbackSession.speed = actual;
+            try { writeStoredJson('playbackSpeed', actual); } catch (_) { showToast('倍速已生效，偏好保存失败'); }
+        } catch (_) { showToast('设置倍速失败'); }
+        finally { event.target.value = String(playbackSession.speed); event.target.disabled = !playbackSession.active?.ready; }
+    });
+    playbackUi['segment-toggle'].addEventListener('click', () => {
+        playbackUi['segment-panel'].hidden = !playbackUi['segment-panel'].hidden;
+        playbackUi['segment-toggle'].setAttribute('aria-expanded', String(!playbackUi['segment-panel'].hidden));
+    });
+    document.getElementById('segment-close').addEventListener('click', () => {
+        playbackUi['segment-panel'].hidden = true; playbackUi['segment-toggle'].setAttribute('aria-expanded', 'false'); playbackUi['segment-toggle'].focus();
+    });
+    for (const point of ['a', 'b']) document.getElementById(`segment-set-${point}`).addEventListener('click', () => {
+        const session = playbackSession.active;
+        if (!session?.ready) return;
+        playbackUi[`segment-${point}`].value = preciseTime(session.element?.currentTime ?? session.position);
+        if (playbackUi['segment-a'].value && playbackUi['segment-b'].value) saveSegmentDraft();
+    });
+    document.getElementById('segment-save').addEventListener('click', saveSegmentDraft);
+    for (const id of ['segment-play', 'segment-quick-play']) playbackUi[id].addEventListener('click', () => queueSegmentAction(session => startSegment(session, session.segmentMode === 'loop')));
+    playbackUi['segment-loop'].addEventListener('change', event => {
+        const loop = event.target.checked;
+        event.target.checked = playbackSession.active?.segmentMode === 'loop';
+        queueSegmentAction(session => loop ? startSegment(session, true) : resetSegmentMode(session));
+    });
+    playbackUi['segment-stop'].addEventListener('click', () => queueSegmentAction(resetSegmentMode));
+    playbackUi['segment-clear'].addEventListener('click', () => queueSegmentAction(async session => {
+        await resetSegmentMode(session);
+        if (!isActiveSession(session)) return;
+        session.segment = null; playbackMemory.setSegment(session.key, session.file, null, session.duration); renderSegment();
+    }));
+    document.getElementById('segment-control').addEventListener('wheel', event => event.stopPropagation(), { passive: true });
+    document.getElementById('segment-control').addEventListener('keydown', event => {
+        if (event.key === 'Escape') { playbackUi['segment-panel'].hidden = true; playbackUi['segment-toggle'].setAttribute('aria-expanded', 'false'); }
+        event.stopPropagation();
+    });
+    window.addEventListener('pagehide', () => { saveSession(playbackSession.active, true); playbackMemory.flush(true); });
+    window.addEventListener('beforeunload', () => { saveSession(playbackSession.active, true); playbackMemory.flush(true); });
+    document.addEventListener('visibilitychange', () => { if (document.hidden) saveSession(playbackSession.active, true); });
+    if (isDesktopApp) setInterval(pollDesktopPlayback, 250);
+}
 
 function invokeDesktop(command, args = {}) {
     if (!isDesktopApp) {
@@ -240,19 +597,32 @@ function describeMpvError(error) {
 
 function queueDesktopNavigation(index) {
     const requestId = ++desktopState.navigationRequest;
+    const outgoing = leavePlaybackSession();
+    const video = state.playlist[index];
+    const session = video ? createPlaybackSession(video, playbackSession.generation) : null;
+    playbackSession.pending = session;
+    desktopState.duration = NaN;
+    desktopState.currentTime = 0;
     // 一个文件结束时，end-file 和 eof-reached 可能连续到达；切换到新文件后允许新一轮结束检测。
     desktopState.endHandled = false;
     const job = desktopState.navigationChain
         .catch(() => {})
-        .then(() => {
-            if (requestId !== desktopState.navigationRequest || !desktopState.started) return;
-            const video = state.playlist[index];
+        .then(async () => {
+            await captureDesktopSession(outgoing);
+            if (requestId !== desktopState.navigationRequest || !desktopState.started || !session) return;
             if (!video?.path) throw new Error('当前媒体缺少文件路径');
-            return desktopPlayer.loadFile(video.path);
+            const record = playbackMemory.get(session.key, video);
+            await invokeDesktop('playback_load', { generation: session.generation, path: video.path,
+                start: InfinityPlaybackMemory.resumePosition(record), speed: playbackSession.speed,
+                autoplay: state.options.autoPlay, loopSingle: state.options.loopSingle });
+            pollDesktopPlayback();
         });
 
     desktopState.navigationChain = job.catch(() => {});
-    job.catch(error => console.error('mpv 切换失败:', error));
+    job.catch(error => {
+        console.error('mpv 切换失败:', error);
+        if (playbackSession.pending === session) showToast('当前视频加载失败，请重新选择视频');
+    });
     return requestId;
 }
 
@@ -277,26 +647,28 @@ const desktopPlayer = {
     },
     set currentTime(value) {
         const nextTime = Math.max(0, Number(value) || 0);
-        desktopState.currentTime = nextTime;
-        sendDesktopCommand(['set_property', 'time-pos', String(nextTime)]).catch(() => {});
+        queueSegmentAction(async session => {
+            if (session.segmentMode && (nextTime < session.segment.a || nextTime >= session.segment.b)) await resetSegmentMode(session);
+            if (!await setSessionProperty(session, 'time-pos', nextTime)) return;
+            session.completed = false; session.position = nextTime;
+            saveSession(session, true); pollDesktopPlayback();
+        });
     },
     get duration() {
         return desktopState.duration;
     },
     set loop(value) {
-        sendDesktopCommand(['set_property', 'loop-file', value ? 'yes' : 'no']).catch(() => {});
+        const session = playbackSession.active;
+        if (!session?.segmentMode) setSessionProperty(session, 'loop-file', value ? 'inf' : 'no').catch(() => {});
     },
     play() {
-        desktopState.paused = false;
-        state.isPlaying = true;
-        updatePlayPauseButton();
-        return sendDesktopCommand(['set_property', 'pause', 'no']);
+        const session = playbackSession.active;
+        if (session) session.completed = false;
+        return setSessionProperty(session, 'pause', false).then(pollDesktopPlayback);
     },
     pause() {
-        desktopState.paused = true;
-        state.isPlaying = false;
-        updatePlayPauseButton();
-        return sendDesktopCommand(['set_property', 'pause', 'yes']);
+        const session = playbackSession.active;
+        return setSessionProperty(session, 'pause', true).then(() => captureDesktopSession(session)).then(pollDesktopPlayback);
     },
     requestFullscreen() {
         if (isDesktopApp) {
@@ -309,10 +681,9 @@ const desktopPlayer = {
     },
     loadFile(path) {
         if (!desktopState.started || !path) return Promise.resolve();
-        queuePlaybackLog('load-request', {
-            command: ['loadfile', 'replace']
-        }, path);
-        return sendDesktopCommand(['loadfile', path, 'replace']);
+        const index = state.playlist.findIndex(file => file.path === path);
+        if (index >= 0) queueDesktopNavigation(index);
+        return desktopState.navigationChain;
     },
 };
 
@@ -350,6 +721,8 @@ function handleDesktopProperty(payload) {
     const name = payload?.name;
     const value = payload?.value;
     if (!name) return;
+    // 时间、暂停及 EOF 只从原生带媒体 ID/加载代次的快照读取，迟到通知不参与保存或导航。
+    if (['time-pos', 'duration', 'pause', 'eof-reached'].includes(name)) return;
 
     switch (name) {
         case 'time-pos':
@@ -443,6 +816,8 @@ function isNaturalDesktopEnd(reason) {
 }
 
 function scheduleDesktopNext() {
+    const active = playbackSession.active;
+    if (!isActiveSession(active) || active.segmentMode) return;
     if (
         desktopState.endHandled
         || desktopState.mode !== 'mpv'
@@ -473,6 +848,8 @@ function scheduleDesktopNext() {
 }
 
 function handleDesktopInput(args) {
+    if (document.activeElement?.closest('input, textarea, select, .segment-control')) return;
+    if (document.getElementById('app-dialog')?.open) return;
     if (!Array.isArray(args) || args.length === 0) return;
 
     switch (args[0]) {
@@ -546,36 +923,23 @@ async function setupDesktopBridge() {
                 && isNaturalDesktopEnd(payload?.reason)
             ) {
                 queuePlaybackLog('end-file', { mpvEvent: payload });
-                scheduleDesktopNext();
-            } else if (payload?.event === 'end-file' && payload?.reason === 'error') {
-                queuePlaybackLog('playback-error', {
-                    errorCode: payload.error,
-                    errorDescription: describeMpvError(payload.error),
-                    mpvEvent: payload
-                });
-                const errorDetail = payload.error !== undefined
-                    ? `：${describeMpvError(payload.error)}`
-                    : '';
-                showToast(`❌ 当前文件无法播放${errorDetail}`);
-                if (desktopState.mode === 'mpv' && state.options.autoPlay && !state.options.loopSingle) {
-                    const failedIndex = state.currentIndex;
-                    const requestId = desktopState.navigationRequest;
-                    setTimeout(() => {
-                        if (
-                            desktopState.mode === 'mpv'
-                            && state.currentIndex === failedIndex
-                            && desktopState.navigationRequest === requestId
-                        ) {
-                            playNext();
-                        }
-                    }, 0);
-                }
+                pollDesktopPlayback();
+            } else if (payload?.event === 'end-file' && (payload?.reason === 'error' || payload?.reason === 4)) {
+                handleDesktopFailure(payload);
             }
+
+            if (eventName === 'file-loaded' || eventName === 'playback-restart') pollDesktopPlayback();
 
             if (eventName && eventName !== 'property-change' && eventName !== 'client-message'
                 && eventName !== 'backend-exited' && eventName !== 'end-file') {
                 queuePlaybackLog('mpv-event', { mpvEvent: payload });
             }
+        }),
+        listen('save-before-exit', async () => {
+            await captureDesktopSession(playbackSession.active);
+            saveSession(playbackSession.active, true);
+            playbackMemory.flush(true);
+            invokeDesktop('finish_exit').catch(() => {});
         }),
         listen('folder-scan-progress', event => {
             const progress = getTauriPayload(event);
@@ -592,8 +956,20 @@ async function setupDesktopBridge() {
     return desktopState.eventReady;
 }
 
+async function handleDesktopFailure(payload) {
+    const session = playbackSession.pending || playbackSession.active;
+    if (!session) return;
+    try {
+        const belongs = await invokeDesktop('playback_failure', { generation: session.generation, mediaId: payload.playlist_entry_id });
+        if (!belongs || session.generation !== playbackSession.generation) return;
+        showToast(`当前文件无法播放：${describeMpvError(payload.error)}`);
+        if (state.options.autoPlay && !state.options.loopSingle && !session.segmentMode) playNext();
+    } catch (_) { /* 旧内核/已销毁的错误不影响当前文件。 */ }
+}
+
 async function ensureDesktopPlayer() {
     if (!isDesktopApp) return;
+    await desktopState.destroyPromise;
     await setupDesktopBridge();
     if (desktopState.started) return;
     const mpvLogPath = await invokeDesktop('get_mpv_log_path')
@@ -848,6 +1224,52 @@ const bgState = {
     rotationRequest: 0
 };
 
+// 串行显示确认和消息，使用 dialog 的顶层与原生焦点约束。
+let appDialogQueue = Promise.resolve();
+
+function showAppDialog({ title = '提示', message = '', detail = '', confirmText = '知道了', cancelText = '取消', confirm = false, danger = false } = {}) {
+    const show = () => new Promise(resolve => {
+        const dialog = document.getElementById('app-dialog');
+        const accept = document.getElementById('app-dialog-confirm');
+        const cancel = document.getElementById('app-dialog-cancel');
+        const close = document.getElementById('app-dialog-close');
+        const detailElement = document.getElementById('app-dialog-detail');
+        const previousFocus = document.activeElement;
+        document.getElementById('app-dialog-title').textContent = title;
+        document.getElementById('app-dialog-message').textContent = message;
+        detailElement.textContent = detail;
+        detailElement.classList.toggle('hidden', !detail);
+        dialog.classList.toggle('is-danger', danger);
+        cancel.classList.toggle('hidden', !confirm);
+        accept.textContent = confirmText;
+        cancel.textContent = cancelText;
+        let accepted = false;
+        const finish = value => { accepted = value; dialog.close(); };
+        const onAccept = () => finish(true);
+        const onCancel = () => finish(false);
+        const onEscape = event => { event.preventDefault(); finish(false); };
+        const onClose = () => {
+            accept.removeEventListener('click', onAccept);
+            cancel.removeEventListener('click', onCancel);
+            close.removeEventListener('click', onCancel);
+            dialog.removeEventListener('cancel', onEscape);
+            if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
+            resolve(accepted);
+        };
+        accept.addEventListener('click', onAccept);
+        cancel.addEventListener('click', onCancel);
+        close.addEventListener('click', onCancel);
+        dialog.addEventListener('cancel', onEscape);
+        dialog.addEventListener('close', onClose, { once: true });
+        closeMoveTargetMenu();
+        dialog.showModal();
+        (confirm ? cancel : accept).focus({ preventScroll: true });
+    });
+    const result = appDialogQueue.then(show);
+    appDialogQueue = result.catch(error => console.error('显示提示失败:', error));
+    return result;
+}
+
 const COMMON_VIDEO_FOLDERS_KEY = 'commonVideoFolders';
 const WALLPAPER_FOLDER_KEY = 'wallpaperFolder';
 const WALLPAPER_CACHE_STORE_NAME = 'wallpaperCache';
@@ -855,6 +1277,7 @@ const WALLPAPER_INTERVAL_KEY = 'wallpaperIntervalSeconds';
 const MOVE_FOLDER_KEY = 'moveFolder';
 const MOVE_FOLDERS_KEY = 'moveFolders';
 const FOLDER_GROUP_COLLAPSE_KEY = 'folderGroupCollapse';
+const FOLDER_FAVORITES_KEY = 'folderFavorites';
 const DEFAULT_WALLPAPER_INTERVAL_SECONDS = 12;
 const MAX_BACKGROUND_IMAGE_CACHE = 2;
 const BACKGROUND_IDLE_TIMEOUT_MS = 1200;
@@ -880,16 +1303,33 @@ function createConfigId(prefix) {
     return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-function normalizeFolderGroups(raw, legacyName = '未分组') {
+function getDefaultFolderGroupName(kind) {
+    return kind === 'move' ? '默认移动目标' : '默认收藏夹';
+}
+
+function directoryIcon(name) {
+    const paths = {
+        folder: '<path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>',
+        chevron: '<path d="m6 9 6 6 6-6"/>',
+        up: '<path d="m7 14 5-5 5 5"/>',
+        down: '<path d="m7 10 5 5 5-5"/>',
+        edit: '<path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15Z"/>',
+        remove: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/>'
+    };
+    return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name]}</svg>`;
+}
+
+function normalizeFolderGroups(raw, legacyName = '默认收藏夹') {
     if (Array.isArray(raw) && raw.some(item => Array.isArray(item?.folders))) {
-        return raw.map(group => ({
-            id: group.id || createConfigId('group'),
+        return raw.filter(group => group && typeof group === 'object').map(group => ({
+            id: group.id || stableFolderId('group', `${legacyName}:${raw.indexOf(group)}`),
             name: group.name || legacyName,
             folders: Array.isArray(group.folders)
-                ? group.folders.filter(folder => folder && typeof folder.path === 'string' && folder.path).map(folder => ({
-                    id: folder.id || createConfigId('folder'),
+                ? group.folders.filter(folder => folder && typeof folder.path === 'string' && folder.path).map((folder, index) => ({
+                    id: folder.id || stableFolderId('folder', `${group.id || raw.indexOf(group)}:${index}:${folder.path}`),
                     path: folder.path,
-                    name: folder.name || getFolderName(folder.path)
+                    name: folder.name || getFolderName(folder.path),
+                    note: typeof folder.note === 'string' ? folder.note : ''
                 }))
                 : []
         }));
@@ -901,36 +1341,58 @@ function normalizeFolderGroups(raw, legacyName = '未分组') {
     if (legacyFolders.length === 0) return [];
 
     return [{
-        id: createConfigId('group'),
+        id: stableFolderId('group', legacyName),
         name: legacyName,
-        folders: legacyFolders.map(folder => ({
-            id: folder.id || createConfigId('folder'),
+        folders: legacyFolders.map((folder, index) => ({
+            id: folder.id || stableFolderId('folder', `${index}:${folder.path}`),
             path: folder.path,
-            name: folder.name || getFolderName(folder.path)
+            name: folder.name || getFolderName(folder.path),
+            note: typeof folder.note === 'string' ? folder.note : ''
         }))
     }];
 }
 
+function stableFolderId(prefix, value) {
+    // 兼容读取也保持稳定身份；迁移失败时不能每次刷新都重建 ID。
+    let hash = 2166136261;
+    for (const char of value) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+    return `${prefix}_legacy_${(hash >>> 0).toString(36)}`;
+}
+
+function backupFolderConfiguration() {
+    const key = 'folderConfigurationBackupV2';
+    if (storage.getItem(key)) return;
+    const values = {};
+    for (const name of [COMMON_VIDEO_FOLDERS_KEY, MOVE_FOLDERS_KEY, MOVE_FOLDER_KEY, FOLDER_FAVORITES_KEY, FOLDER_GROUP_COLLAPSE_KEY]) {
+        values[name] = storage.getItem(name);
+    }
+    writeStoredJson(key, { createdAt: new Date().toISOString(), values });
+}
+
 function getFolderGroups(storageKey, legacyKey = null) {
+    const defaultName = getDefaultFolderGroupName(storageKey === MOVE_FOLDERS_KEY ? 'move' : 'common');
     const raw = readStoredJson(storageKey, null);
-    if (raw !== null) return normalizeFolderGroups(raw);
-    return legacyKey ? normalizeFolderGroups(readStoredJson(legacyKey, null)) : [];
+    if (raw !== null) return normalizeFolderGroups(raw, defaultName);
+    return legacyKey ? normalizeFolderGroups(readStoredJson(legacyKey, null), defaultName) : [];
 }
 
 function writeFolderGroups(storageKey, groups) {
+    backupFolderConfiguration();
     writeStoredJson(storageKey, groups.map(group => ({
         id: group.id,
         name: group.name,
         folders: group.folders.map(folder => ({
             id: folder.id,
             path: folder.path,
-            name: folder.name
+            name: folder.name,
+            note: typeof folder.note === 'string' ? folder.note : ''
         }))
     })));
 }
 
 function getCommonVideoGroups() {
-    return getFolderGroups(COMMON_VIDEO_FOLDERS_KEY);
+    const groups = getFolderGroups(COMMON_VIDEO_FOLDERS_KEY);
+    return groups.length ? [{ id: groups[0].id, name: '常看播放文件夹', folders: groups.flatMap(group => group.folders) }] : [];
 }
 
 function getMoveFolderGroups() {
@@ -939,6 +1401,43 @@ function getMoveFolderGroups() {
 
 function getMoveFolders() {
     return getMoveFolderGroups().flatMap(group => group.folders);
+}
+
+function getFavoriteFolderIds(kind) {
+    const saved = readStoredJson(FOLDER_FAVORITES_KEY, {});
+    return new Set(Array.isArray(saved?.[kind]) ? saved[kind].filter(id => typeof id === 'string') : []);
+}
+
+function getOrderedGroupFolders(group, kind, favorites = getFavoriteFolderIds(kind)) {
+    // 仅对显示顺序做稳定分区，保留原配置中的手动顺序，取消收藏即可还原。
+    return [
+        ...group.folders.filter(folder => favorites.has(folder.id)),
+        ...group.folders.filter(folder => !favorites.has(folder.id))
+    ];
+}
+
+function toggleFolderFavorite(kind, groupId, folderId) {
+    const groups = kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
+    const group = groups.find(item => item.id === groupId);
+    if (!group?.folders.some(folder => folder.id === folderId)) return;
+    const raw = readStoredJson(FOLDER_FAVORITES_KEY, {});
+    const saved = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const favorites = getFavoriteFolderIds(kind);
+    if (favorites.has(folderId)) favorites.delete(folderId);
+    else favorites.add(folderId);
+    const validIds = new Set(groups.flatMap(item => item.folders.map(folder => folder.id)));
+    writeStoredJson(FOLDER_FAVORITES_KEY, {
+        ...saved,
+        [kind]: [...favorites].filter(id => validIds.has(id))
+    });
+    kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
+    const list = kind === 'common' ? elements.commonVideoFolders : elements.moveFolderSummary;
+    const section = [...(list?.querySelectorAll('.directory-group') || [])]
+        .find(item => item.dataset.groupId === groupId);
+    const row = [...(section?.querySelectorAll('.directory-folder-item') || [])]
+        .find(item => item.dataset.folderId === folderId);
+    row?.querySelector('.favorite-folder')?.focus({ preventScroll: true });
+    row?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 
 function getCollapsedFolderGroups(kind) {
@@ -973,42 +1472,51 @@ function getFolderName(path) {
 }
 
 function renderFolderGroup(group, kind, groupIndex, groupCount = 1) {
-    const isCommon = kind === 'common';
     const collapsed = getCollapsedFolderGroups(kind).has(group.id);
-    const folders = group.folders.map((folder, folderIndex) => `
+    const favorites = getFavoriteFolderIds(kind);
+    const ordered = getOrderedGroupFolders(group, kind, favorites);
+    const folders = ordered.map((folder, folderIndex) => `
         <div class="directory-item directory-folder-item" data-folder-id="${escapeHtml(folder.id)}">
             <div class="directory-item-main" tabindex="0" role="button">
-                <span class="directory-item-name">${escapeHtml(folder.name || getFolderName(folder.path))}</span>
+                <span class="directory-item-name" title="${escapeHtml(folder.name || getFolderName(folder.path))}">${escapeHtml(folder.name || getFolderName(folder.path))}</span>
                 <span class="directory-item-path" title="${escapeHtml(folder.path)}">${escapeHtml(folder.path)}</span>
+                ${folder.note ? `<span class="folder-note-tooltip" role="tooltip">${escapeHtml(folder.note)}</span>` : ''}
             </div>
             <div class="directory-item-actions">
-                <button class="directory-item-action move-up" type="button" ${folderIndex === 0 ? 'disabled' : ''}>↑</button>
-                <button class="directory-item-action move-down" type="button" ${folderIndex === group.folders.length - 1 ? 'disabled' : ''}>↓</button>
-                <button class="directory-item-action edit-folder" type="button">编辑</button>
-                <button class="directory-item-action remove-folder" type="button">移除</button>
+                <button class="directory-item-action sort-action move-up" type="button" title="上移文件夹" aria-label="上移文件夹" ${folderIndex === 0 || favorites.has(ordered[folderIndex - 1].id) !== favorites.has(folder.id) ? 'disabled' : ''}>${directoryIcon('up')}</button>
+                <button class="directory-item-action sort-action move-down" type="button" title="下移文件夹" aria-label="下移文件夹" ${folderIndex === ordered.length - 1 || favorites.has(ordered[folderIndex + 1].id) !== favorites.has(folder.id) ? 'disabled' : ''}>${directoryIcon('down')}</button>
+                <button class="directory-item-action sort-action edit-folder" type="button" title="编辑文件夹" aria-label="编辑文件夹">${directoryIcon('edit')}</button>
+                <button class="directory-item-action sort-action remove-folder" type="button" title="移除文件夹配置" aria-label="移除文件夹配置">${directoryIcon('remove')}</button>
             </div>
+            <button class="favorite-folder" type="button" aria-pressed="${favorites.has(folder.id)}"
+                title="${favorites.has(folder.id) ? '取消收藏' : '收藏并置顶'}" aria-label="${favorites.has(folder.id) ? '取消收藏' : '收藏并置顶'}">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.78 5.64L21 9.55l-4.5 4.39 1.06 6.2L12 17.21l-5.56 2.93 1.06-6.2L3 9.55l6.22-.91L12 3Z"/></svg>
+            </button>
         </div>
     `).join('');
+
+    if (kind === 'common') return `<div class="directory-group common-folder-list" data-group-id="${escapeHtml(group.id)}">${folders}</div>`;
 
     return `
         <section class="directory-group${collapsed ? ' is-collapsed' : ''}" data-group-id="${escapeHtml(group.id)}">
             <div class="directory-group-heading" tabindex="0" role="button" aria-expanded="${collapsed ? 'false' : 'true'}">
                 <div class="directory-group-title">
                     <button class="directory-group-toggle" type="button" aria-label="${collapsed ? '展开' : '收起'}分组">
-                        <span class="directory-group-chevron">⌄</span>
+                        <span class="directory-group-chevron">${directoryIcon('chevron')}</span>
                     </button>
-                    <span class="directory-group-icon">▦</span>
-                    <span>${escapeHtml(group.name || '未命名分组')}</span>
+                    <span class="directory-group-icon">${directoryIcon('folder')}</span>
+                    <span class="directory-group-name" title="${escapeHtml(group.name || '未命名分组').replaceAll('"', '&quot;')}">${escapeHtml(group.name || '未命名分组')}</span>
                     <small>${group.folders.length} 个文件夹</small>
                 </div>
                 <div class="directory-item-actions directory-group-actions">
-                    <button class="directory-item-action group-up" type="button" ${groupIndex === 0 ? 'disabled' : ''}>↑</button>
-                    <button class="directory-item-action group-down" type="button" ${groupIndex === groupCount - 1 ? 'disabled' : ''}>↓</button>
+                    <button class="directory-item-action sort-action group-up" type="button" title="上移分组" aria-label="上移分组" ${groupIndex === 0 ? 'disabled' : ''}>${directoryIcon('up')}</button>
+                    <button class="directory-item-action sort-action group-down" type="button" title="下移分组" aria-label="下移分组" ${groupIndex === groupCount - 1 ? 'disabled' : ''}>${directoryIcon('down')}</button>
                     <button class="directory-item-action edit-group" type="button">改名</button>
                     <button class="directory-item-action remove-group" type="button">移除组</button>
                 </div>
             </div>
             <div class="directory-group-folders">
+                ${group.name === '未分组' ? '<p class="directory-group-note">未指定分组的文件夹保存在这里，可点击“改名”修改名称。</p>' : ''}
                 ${folders || '<div class="directory-empty">组内还没有文件夹</div>'}
             </div>
         </section>
@@ -1020,10 +1528,14 @@ function reorderFolderGroup(kind, groupId, folderId, delta) {
     const groups = kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
     const group = groups.find(item => item.id === groupId);
     if (!group) return;
-    const index = group.folders.findIndex(folder => folder.id === folderId);
+    const favorites = getFavoriteFolderIds(kind);
+    const category = group.folders.filter(folder => favorites.has(folder.id) === favorites.has(folderId));
+    const index = category.findIndex(folder => folder.id === folderId);
     const nextIndex = index + delta;
-    if (index < 0 || nextIndex < 0 || nextIndex >= group.folders.length) return;
-    [group.folders[index], group.folders[nextIndex]] = [group.folders[nextIndex], group.folders[index]];
+    if (index < 0 || nextIndex < 0 || nextIndex >= category.length) return;
+    const from = group.folders.findIndex(folder => folder.id === category[index].id);
+    const to = group.folders.findIndex(folder => folder.id === category[nextIndex].id);
+    [group.folders[from], group.folders[to]] = [group.folders[to], group.folders[from]];
     writeFolderGroups(key, groups);
     kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
 }
@@ -1050,13 +1562,19 @@ function removeConfiguredFolder(kind, groupId, folderId) {
     showToast('文件夹已移除');
 }
 
-function removeFolderGroup(kind, groupId) {
+async function removeFolderGroup(kind, groupId) {
     const key = kind === 'common' ? COMMON_VIDEO_FOLDERS_KEY : MOVE_FOLDERS_KEY;
     const groups = kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
     const group = groups.find(item => item.id === groupId);
     if (!group) return;
-    if (group.folders.length > 0 && !window.confirm(`分组“${group.name}”内还有文件夹，确定移除整个分组吗？`)) return;
-    writeFolderGroups(key, groups.filter(item => item.id !== groupId));
+    if (group.folders.length > 0 && !await showAppDialog({
+        title: '移除分组',
+        message: `移除“${group.name}”及其中的 ${group.folders.length} 个文件夹配置？`,
+        detail: '只移除软件中的分组和路径记录，磁盘上的文件夹与文件会保留。',
+        confirm: true, confirmText: '移除分组', danger: true
+    })) return;
+    const latestGroups = kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
+    writeFolderGroups(key, latestGroups.filter(item => item.id !== groupId));
     kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
     showToast('分组已移除');
 }
@@ -1104,7 +1622,22 @@ function bindFolderGroupActions(list, kind) {
             const folderId = folderElement.dataset.folderId;
             const folder = group.folders.find(item => item.id === folderId);
             if (!folder) return;
+            folderElement.querySelector('.favorite-folder')?.addEventListener('click', () => toggleFolderFavorite(kind, groupId, folderId));
             const open = () => openDesktopFolder(folder.path, folder.name || getFolderName(folder.path));
+            const main = folderElement.querySelector('.directory-item-main');
+            const note = main?.querySelector('.folder-note-tooltip');
+            if (note) {
+                const placeNote = () => {
+                    note.classList.remove('below');
+                    note.style.left = '0'; note.style.right = 'auto';
+                    const rect = main.getBoundingClientRect();
+                    const popup = note.getBoundingClientRect();
+                    note.classList.toggle('below', rect.top < popup.height + 12);
+                    if (rect.left + popup.width > window.innerWidth - 16) { note.style.left = 'auto'; note.style.right = '0'; }
+                };
+                main.addEventListener('mouseenter', placeNote);
+                main.addEventListener('focus', placeNote);
+            }
             folderElement.querySelector('.directory-item-main')?.addEventListener('click', open);
             folderElement.querySelector('.directory-item-main')?.addEventListener('keydown', event => {
                 if (event.key === 'Enter' || event.key === ' ') {
@@ -1173,7 +1706,7 @@ function saveWallpaperInterval() {
 }
 
 function openFolderAliasModal(editor = {}) {
-    pendingFolderEditor = editor;
+    pendingFolderEditor = { ...editor, createGroup: false };
     if (!elements.folderAliasModal) return;
 
     const isGroup = editor.type === 'group';
@@ -1188,14 +1721,29 @@ function openFolderAliasModal(editor = {}) {
     elements.folderAliasPath.classList.toggle('hidden', isGroup);
     elements.folderAliasInputLabel.textContent = isGroup ? '分组名称' : '文件夹名称';
     elements.folderAliasInput.value = currentName;
-    elements.folderAliasGroupLabel.classList.toggle('hidden', isGroup);
-    elements.folderAliasGroup.classList.toggle('hidden', isGroup);
+    elements.folderAliasNote.value = editor.folder?.note || '';
+    elements.folderAliasNote.classList.toggle('hidden', isGroup);
+    elements.folderAliasNoteLabel.classList.toggle('hidden', isGroup);
+    elements.folderAliasGroupLabel.classList.toggle('hidden', isGroup || isCommon);
+    elements.folderAliasGroup.classList.toggle('hidden', isGroup || isCommon);
+    elements.folderAliasGroupControls.classList.toggle('hidden', isGroup || isCommon);
+    elements.folderAliasGroupHint.classList.toggle('hidden', isGroup || isCommon);
+    elements.folderAliasNewGroupFields.classList.add('hidden');
+    elements.folderAliasNewGroupName.value = '';
+    elements.folderAliasNewGroupName.removeAttribute('aria-invalid');
+    elements.folderAliasNewGroupError.classList.add('hidden');
+    elements.folderAliasCreateGroup.textContent = '新建分组';
+    elements.folderAliasCreateGroup.setAttribute('aria-expanded', 'false');
+    elements.folderAliasGroup.disabled = false;
     if (!isGroup) {
         const groups = isCommon ? getCommonVideoGroups() : getMoveFolderGroups();
         elements.folderAliasGroup.innerHTML = groups.length > 0
             ? groups.map(group => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}</option>`).join('')
-            : '<option value="">未分组（保存时自动创建）</option>';
+            : `<option value="">${getDefaultFolderGroupName(editor.kind)}（自动创建）</option>`;
         elements.folderAliasGroup.value = editor.groupId || groups[0]?.id || '';
+        elements.folderAliasGroupHint.textContent = isCommon
+            ? '这里只显示常用文件夹分组；移动目标分组在首页单独管理。调整分组不会移动磁盘文件。'
+            : '这里只显示移动目标分组。调整分组不会移动磁盘文件。';
     }
     elements.folderAliasModal.classList.remove('hidden');
     requestAnimationFrame(() => {
@@ -1209,6 +1757,24 @@ function closeFolderAliasModal() {
     elements.folderAliasModal?.classList.add('hidden');
 }
 
+function toggleFolderAliasNewGroup() {
+    if (!pendingFolderEditor || pendingFolderEditor.type === 'group' || pendingFolderEditor.kind === 'common') return;
+    const createGroup = !pendingFolderEditor.createGroup;
+    pendingFolderEditor.createGroup = createGroup;
+    elements.folderAliasNewGroupFields.classList.toggle('hidden', !createGroup);
+    elements.folderAliasGroup.disabled = createGroup;
+    elements.folderAliasCreateGroup.textContent = createGroup ? '选择已有分组' : '新建分组';
+    elements.folderAliasCreateGroup.setAttribute('aria-expanded', String(createGroup));
+    (createGroup ? elements.folderAliasNewGroupName : elements.folderAliasGroup).focus();
+}
+
+function showFolderAliasGroupError(message) {
+    elements.folderAliasNewGroupError.textContent = message;
+    elements.folderAliasNewGroupError.classList.remove('hidden');
+    elements.folderAliasNewGroupName.setAttribute('aria-invalid', 'true');
+    elements.folderAliasNewGroupName.focus();
+}
+
 function saveFolderAlias() {
     const editor = pendingFolderEditor;
     if (!editor) {
@@ -1219,6 +1785,7 @@ function saveFolderAlias() {
     const name = elements.folderAliasInput.value.trim() || (editor.type === 'group' ? '未命名分组' : getFolderName(editor.folder?.path || editor.path));
     const key = editor.kind === 'common' ? COMMON_VIDEO_FOLDERS_KEY : MOVE_FOLDERS_KEY;
     const groups = editor.kind === 'common' ? getCommonVideoGroups() : getMoveFolderGroups();
+    const note = elements.folderAliasNote.value.trim();
 
     if (editor.type === 'group') {
         if (editor.group?.id) {
@@ -1233,27 +1800,48 @@ function saveFolderAlias() {
             closeFolderAliasModal();
             return;
         }
-        let targetGroup = groups.find(group => group.id === elements.folderAliasGroup.value);
+        let targetGroup;
+        if (editor.kind === 'common') {
+            targetGroup = groups[0];
+        } else if (editor.createGroup) {
+            const groupName = elements.folderAliasNewGroupName.value.trim();
+            if (!groupName) {
+                showFolderAliasGroupError('请输入新分组名称');
+                return;
+            }
+            if (groups.some(group => group.name === groupName)) {
+                showFolderAliasGroupError('已有同名分组，请点击“选择已有分组”后选择它');
+                return;
+            }
+            targetGroup = { id: createConfigId('group'), name: groupName, folders: [] };
+            groups.push(targetGroup);
+        } else {
+            targetGroup = groups.find(group => group.id === elements.folderAliasGroup.value);
+        }
         if (!targetGroup) {
-            targetGroup = { id: createConfigId('group'), name: '未分组', folders: [] };
+            targetGroup = { id: createConfigId('group'), name: getDefaultFolderGroupName(editor.kind), folders: [] };
             groups.push(targetGroup);
         }
         if (editor.folder?.id) {
             const oldGroup = groups.find(group => group.folders.some(folder => folder.id === editor.folder.id));
             const folder = oldGroup?.folders.find(item => item.id === editor.folder.id);
             if (folder) {
-                oldGroup.folders = oldGroup.folders.filter(item => item.id !== folder.id);
-                targetGroup.folders.push({ ...folder, name, path });
+                if (oldGroup.id === targetGroup.id) {
+                    oldGroup.folders = oldGroup.folders.map(item => item.id === folder.id ? { ...folder, name, path, note } : item);
+                } else {
+                    oldGroup.folders = oldGroup.folders.filter(item => item.id !== folder.id);
+                    targetGroup.folders.push({ ...folder, name, path, note });
+                }
             }
         } else {
-            targetGroup.folders.push({ id: createConfigId('folder'), path, name });
+            targetGroup.folders.push({ id: createConfigId('folder'), path, name, note });
         }
     }
 
     writeFolderGroups(key, groups);
     editor.kind === 'common' ? renderCommonVideoFolders() : renderMoveFolderSummary();
     closeFolderAliasModal();
-    showToast(editor.type === 'group' ? '分组名称已更新' : editor.folder?.id ? '文件夹名称已更新' : '文件夹已保存');
+    showToast(editor.type === 'group' ? '分组名称已更新' : '文件夹配置已保存');
 }
 
 async function addCommonVideoFolder() {
@@ -1264,10 +1852,6 @@ async function addCommonVideoFolder() {
 
     const path = await invokeDesktop('pick_folder');
     if (path) openFolderAliasModal({ kind: 'common', type: 'folder', path });
-}
-
-function addCommonVideoGroup() {
-    openFolderAliasModal({ kind: 'common', type: 'group' });
 }
 
 async function scanWallpaperImageFiles(path) {
@@ -1381,14 +1965,19 @@ function addMoveFolderGroup() {
 
 /* 保留旧配置读取兼容性；首次保存新的分组配置时会自然迁移到 moveFolders。 */
 function migrateFolderConfiguration() {
+    backupFolderConfiguration();
     const commonRaw = readStoredJson(COMMON_VIDEO_FOLDERS_KEY, null);
-    if (commonRaw !== null && !(Array.isArray(commonRaw) && commonRaw.some(item => Array.isArray(item?.folders)))) {
-        writeFolderGroups(COMMON_VIDEO_FOLDERS_KEY, normalizeFolderGroups(commonRaw));
+    if (commonRaw !== null) {
+        const flat = getCommonVideoGroups();
+        if (JSON.stringify(commonRaw) !== JSON.stringify(flat)) writeFolderGroups(COMMON_VIDEO_FOLDERS_KEY, flat);
     }
     const moveRaw = readStoredJson(MOVE_FOLDERS_KEY, null);
     if (moveRaw === null) {
         const legacyMove = readStoredJson(MOVE_FOLDER_KEY, null);
-        if (legacyMove) writeFolderGroups(MOVE_FOLDERS_KEY, normalizeFolderGroups(legacyMove));
+        if (legacyMove) writeFolderGroups(MOVE_FOLDERS_KEY, normalizeFolderGroups(legacyMove, getDefaultFolderGroupName('move')));
+    } else {
+        const normalized = normalizeFolderGroups(moveRaw, getDefaultFolderGroupName('move'));
+        if (JSON.stringify(moveRaw) !== JSON.stringify(normalized)) writeFolderGroups(MOVE_FOLDERS_KEY, normalized);
     }
 }
 
@@ -1398,8 +1987,7 @@ async function loadBackgroundImages() {
         ? window.INFINITY_LOOP_BACKGROUNDS.filter(path => typeof path === 'string' && path)
         : [];
 
-    renderWallpaperFolderSummary();
-    renderMoveFolderSummary();
+    recordStartupStage('wallpaper-load-start');
     const wallpaperFolder = getWallpaperFolder();
     if (isDesktopApp && wallpaperFolder) {
         try {
@@ -1439,9 +2027,10 @@ function startBgRotation() {
     bgState.currentLayer = 1;
     bgState.rotationRequest += 1;
     const rotationRequest = bgState.rotationRequest;
-    preloadBackgroundImage(initialBg).then(() => {
-        if (rotationRequest === bgState.rotationRequest && bgState.bgLayer1) {
+    preloadBackgroundImage(initialBg).then(img => {
+        if (img && rotationRequest === bgState.rotationRequest && bgState.bgLayer1) {
             bgState.bgLayer1.style.backgroundImage = `url('${initialBg}')`;
+            requestAnimationFrame(() => recordStartupStage('first-wallpaper-ready'));
         }
     });
 
@@ -1543,21 +2132,24 @@ function initBgLayers() {
 
 // 初始化
 function init() {
+    recordStartupStage('frontend-init-start');
     console.log('🎬 播放器初始化开始...');
     if (isDesktopApp) {
         document.body.classList.add('desktop-mode');
         setupDesktopBridge().catch(error => console.error('桌面桥接初始化失败:', error));
     }
-    initDB();
     initBgLayers();
     bindEvents();
+    bindPlaybackFeatures();
     loadLastFolder();
-    migrateFolderConfiguration();
+    try { migrateFolderConfiguration(); } catch (error) { console.warn('配置迁移未完成，保留兼容读取:', error); }
     renderCommonVideoFolders();
     loadWallpaperIntervalOption();
     renderMoveFolderSummary();
     scheduleBackgroundLoad();
     loadIncludeSubfoldersOption();
+    renderWallpaperFolderSummary();
+    requestAnimationFrame(() => recordStartupStage('home-interactive'));
     console.log('✅ 播放器初始化完成');
 }
 
@@ -1877,7 +2469,7 @@ async function loadSavedPath(id) {
         });
 
         if (!pathData) {
-            alert('路径不存在');
+            await showAppDialog({ title: '文件夹记录不存在', message: '没有找到保存的路径，请重新选择文件夹。' });
             return;
         }
 
@@ -1891,11 +2483,11 @@ async function loadSavedPath(id) {
             await readDirectoryHandle(pathData.handle, files, includeSubfolders, pathData.name + '/');
             processFiles(files);
         } else {
-            alert('需要授权才能访问该文件夹');
+            await showAppDialog({ title: '需要文件夹访问权限', message: '请重新选择文件夹，并允许软件读取其中的文件。' });
         }
     } catch (error) {
         console.error('加载路径失败:', error);
-        alert('加载失败: ' + error.message);
+        await showAppDialog({ title: '文件夹加载失败', message: '暂时无法读取这个文件夹，请检查路径与访问权限。', detail: String(error?.message || error) });
     } finally {
         showLoading(false);
     }
@@ -1927,16 +2519,15 @@ async function readDirectoryHandle(dirHandle, files, includeSubfolders = true, c
 
 // HTML 转义
 function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    return String(text ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 }
 
 // 加载预设路径（弹出文件选择）
 async function loadPresetPath(id, hint) {
     // 提示用户选择对应文件夹
     const hintMsg = hint ? `\n提示路径: ${hint}` : '';
-    if (!confirm(`请选择对应的文件夹${hintMsg}\n\n点击"确定"打开文件夹选择器`)) {
+    if (!await showAppDialog({ title: '选择文件夹', message: '请选择这个快捷路径对应的文件夹。', detail: hintMsg.trim(), confirm: true, confirmText: '选择文件夹' })) {
         return;
     }
 
@@ -1980,11 +2571,13 @@ async function openDesktopFolder(folderPath = null, displayName = '') {
         showLoading(true);
         const loadingText = elements.loading.querySelector('p');
         if (loadingText) loadingText.textContent = '扫描文件夹 · 准备读取...';
+        recordStartupStage('folder-scan-start');
 
         const files = await invokeDesktop('scan_folder', {
             path: selectedPath,
             includeSubfolders: elements.includeSubfolders.checked
         });
+        recordStartupStage('folder-scan-end');
 
         if (!Array.isArray(files) || files.length === 0) {
             showToast('⚠️ 未找到支持的媒体文件');
@@ -2010,7 +2603,6 @@ async function openDesktopFolder(folderPath = null, displayName = '') {
 // 绑定事件
 function bindEvents() {
     elements.addVideoFolder?.addEventListener('click', addCommonVideoFolder);
-    elements.addVideoGroup?.addEventListener('click', addCommonVideoGroup);
     elements.configureWallpaperFolder?.addEventListener('click', configureWallpaperFolder);
     elements.configureMoveFolder?.addEventListener('click', configureMoveFolder);
     elements.addMoveGroup?.addEventListener('click', addMoveFolderGroup);
@@ -2019,8 +2611,23 @@ function bindEvents() {
     elements.folderAliasClose?.addEventListener('click', closeFolderAliasModal);
     elements.folderAliasCancel?.addEventListener('click', closeFolderAliasModal);
     elements.folderAliasConfirm?.addEventListener('click', saveFolderAlias);
+    elements.folderAliasCreateGroup?.addEventListener('click', toggleFolderAliasNewGroup);
+    elements.folderAliasNewGroupName?.addEventListener('input', () => {
+        elements.folderAliasNewGroupName.removeAttribute('aria-invalid');
+        elements.folderAliasNewGroupError.classList.add('hidden');
+    });
+    elements.folderAliasNewGroupName?.addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            saveFolderAlias();
+        }
+        if (event.key === 'Escape') closeFolderAliasModal();
+    });
     elements.folderAliasInput?.addEventListener('keydown', event => {
         if (event.key === 'Enter') saveFolderAlias();
+        if (event.key === 'Escape') closeFolderAliasModal();
+    });
+    elements.folderAliasNote?.addEventListener('keydown', event => {
         if (event.key === 'Escape') closeFolderAliasModal();
     });
     elements.folderAliasModal?.addEventListener('click', event => {
@@ -2067,7 +2674,7 @@ function bindEvents() {
 
             if (!pathData || !pathData.handle) {
                 showLoading(false);
-                alert('未找到保存的文件夹信息，请重新选择文件夹');
+                await showAppDialog({ title: '无法继续观看', message: '未找到保存的文件夹信息，请重新选择文件夹。' });
                 return;
             }
 
@@ -2093,12 +2700,12 @@ function bindEvents() {
                 processFiles(videoFiles, pathData.handle);
             } else {
                 showLoading(false);
-                alert('需要授权才能访问文件夹');
+                await showAppDialog({ title: '需要文件夹访问权限', message: '请重新选择文件夹，并允许软件读取其中的文件。' });
             }
         } catch (error) {
             console.error('加载失败:', error);
             showLoading(false);
-            alert('加载失败: ' + error.message);
+            await showAppDialog({ title: '文件夹加载失败', message: '暂时无法读取这个文件夹，请检查路径与访问权限。', detail: String(error?.message || error) });
         }
     });
 
@@ -2118,6 +2725,7 @@ function bindEvents() {
 
     // 进度条点击
     elements.progressWrapper.addEventListener('click', handleProgressClick);
+    seekPreview.bind();
 
     // 视频容器滚动
     elements.videoContainer.addEventListener('scroll', handleScroll);
@@ -2236,6 +2844,7 @@ async function readDirectory(directoryEntry, includeSubfolders = true) {
 
 // 处理文件
 function processFiles(files, folderHandle = null) {
+    leavePlaybackSession();
     state.includeSubfolders = elements.includeSubfolders.checked;
     state.folderHandle = folderHandle;
 
@@ -2293,6 +2902,10 @@ function processFiles(files, folderHandle = null) {
 
 // 渲染视频（懒加载模式）
 function renderVideos(targetIndex = 0) {
+    if (!isDesktopApp) {
+        leavePlaybackSession();
+        elements.videoContainer.querySelectorAll('video').forEach(releaseBrowserVideo);
+    }
     elements.videoContainer.innerHTML = '';
 
     const safeIndex = Math.max(0, Math.min(targetIndex, state.playlist.length - 1));
@@ -2362,6 +2975,9 @@ function loadVideoAroundIndex(index) {
         return;
     }
 
+    const previous = playbackSession.active;
+    if (previous?.element && previous.element.dataset.index !== String(index)) leavePlaybackSession();
+    state.currentIndex = index;
     const preloadRange = 2; // 预加载前后各2个视频
 
     // 计算需要加载的视频范围
@@ -2373,8 +2989,7 @@ function loadVideoAroundIndex(index) {
         if (i < startIndex || i > endIndex) {
             const existingVideo = item.querySelector('video');
             if (existingVideo) {
-                existingVideo.pause();
-                existingVideo.src = '';
+                releaseBrowserVideo(existingVideo);
                 item.innerHTML = `<div class="video-placeholder"><span class="placeholder-text">视频 ${i + 1}</span></div>`;
             }
         }
@@ -2389,6 +3004,8 @@ function loadVideoAroundIndex(index) {
     }
 
     state.currentIndex = index;
+    const selectedVideo = videoItems[index]?.querySelector('video');
+    if (selectedVideo?.readyState >= 1) activateBrowserSession(selectedVideo, state.playlist[index]);
     updateVideoCount();
     updatePlaylistHighlight();
 }
@@ -2426,6 +3043,10 @@ function createVideoElement(item, index) {
 
     // 视频事件
     videoEl.addEventListener('loadedmetadata', () => {
+        if (state.playlist[index] === video && index === state.currentIndex && videoEl.isConnected) {
+            activateBrowserSession(videoEl, video);
+            if (state.options.autoPlay) videoEl.play().catch(() => {});
+        }
         // 视频加载完成，如果当前正在显示这个视频的信息，更新时长
         if (videoInfoOverlay && videoInfoOverlay.classList.contains('show') && parseInt(videoInfoOverlay.dataset.currentIndex) === index) {
             const durationEl = videoInfoOverlay.querySelector('.video-info-duration');
@@ -2436,16 +3057,28 @@ function createVideoElement(item, index) {
     });
 
     videoEl.addEventListener('play', () => {
+        if (!isActiveSession(playbackSession.active) || playbackSession.active.element !== videoEl) return;
+        playbackSession.active.completed = false;
         state.isPlaying = true;
         updatePlayPauseButton();
     });
 
     videoEl.addEventListener('pause', () => {
+        if (playbackSession.active?.element !== videoEl) return;
+        saveSession(playbackSession.active, true);
         state.isPlaying = false;
         updatePlayPauseButton();
     });
 
     videoEl.addEventListener('ended', () => {
+        const session = playbackSession.active;
+        if (!isActiveSession(session) || session.element !== videoEl) return;
+        if (session.segmentMode) {
+            if (session.segmentMode === 'loop') { videoEl.currentTime = session.segment.a; videoEl.play().catch(() => {}); }
+            else finishSegmentOnce(session);
+            return;
+        }
+        session.completed = true; saveSession(session, true, true);
         if (!state.options.loopSingle && state.options.autoPlay) {
             playNext();
         }
@@ -2455,17 +3088,37 @@ function createVideoElement(item, index) {
 
     // 进度更新
     videoEl.addEventListener('timeupdate', () => {
-        if (index === state.currentIndex) {
+        const session = playbackSession.active;
+        if (isActiveSession(session) && session.element === videoEl) {
             updateProgress(videoEl);
+            saveSession(session);
+            if (session.segmentMode && videoEl.currentTime >= session.segment.b) {
+                if (session.segmentMode === 'loop') videoEl.currentTime = session.segment.a;
+                else finishSegmentOnce(session);
+            }
         }
     });
 
     item.appendChild(videoEl);
+    videoEl.addEventListener('seeked', () => {
+        const session = playbackSession.active;
+        if (session?.element !== videoEl) return;
+        session.completed = false;
+        if (session.segmentMode && (videoEl.currentTime < session.segment.a || videoEl.currentTime > session.segment.b)) queueSegmentAction(resetSegmentMode);
+        saveSession(session, true);
+    });
 
     // 如果是当前视频，自动播放
-    if (index === state.currentIndex && state.options.autoPlay) {
+    if (index === state.currentIndex && state.options.autoPlay && videoEl.readyState >= 1) {
         videoEl.play().catch(e => console.log('自动播放被阻止:', e));
     }
+}
+
+function releaseBrowserVideo(video) {
+    if (playbackSession.active?.element === video) leavePlaybackSession();
+    video.pause();
+    if (video.src.startsWith('blob:')) URL.revokeObjectURL(video.src);
+    video.removeAttribute('src'); video.load();
 }
 
 // 渲染播放列表
@@ -2548,6 +3201,7 @@ function handleScroll() {
 }
 
 function navigateByWheel(deltaY) {
+    if (state.fileActionBusy) return;
     if (!deltaY) return;
 
     const now = Date.now();
@@ -2596,6 +3250,7 @@ function handleWheel(e) {
 
 // 重新打乱并滚动到顶部
 function reshuffleAndScrollToTop() {
+    if (state.fileActionBusy) return;
     // 防止重复触发
     if (state.isReshuffling) return;
     state.isReshuffling = true;
@@ -2629,6 +3284,7 @@ function reshuffleAndScrollToTop() {
 
 // 从底部洗牌到第一个
 async function reshuffleToFirst() {
+    if (state.fileActionBusy) return;
     if (state.isReshuffling) return;
     if (state.playlist.length <= 1) {
         showToast('只有一个视频，到底啦');
@@ -2680,6 +3336,7 @@ async function reshuffleToFirst() {
 
 // 从顶部洗牌到最后一个
 async function reshuffleToLast() {
+    if (state.fileActionBusy) return;
     if (state.isReshuffling) return;
     if (state.playlist.length <= 1) {
         showToast('只有一个视频，到底啦');
@@ -2732,6 +3389,7 @@ async function reshuffleToLast() {
 
 // 重新打乱并滚动到底部
 function reshuffleAndScrollToLast() {
+    if (state.fileActionBusy) return;
     // 防止重复触发
     if (state.isReshuffling) return;
     state.isReshuffling = true;
@@ -2770,6 +3428,7 @@ function reshuffleAndScrollToLast() {
 
 // 重新洗牌并保持当前位置
 function reshuffleAndKeepPosition() {
+    if (state.fileActionBusy) return;
     // 保存当前视频信息
     const currentVideoInfo = state.playlist[state.currentIndex];
 
@@ -2799,6 +3458,7 @@ function reshuffleAndKeepPosition() {
 
 // 更新视频计数
 function updateVideoCount() {
+    seekPreview.syncMedia();
     elements.videoCount.textContent = `${state.currentIndex + 1} / ${state.playlist.length}`;
     updateVideoInfoBar();
     updatePlayerActions();
@@ -2831,7 +3491,7 @@ function openMoveTargetMenu(button, group) {
     menu.className = 'move-target-menu';
     menu.innerHTML = `
         <div class="move-target-menu-title">${escapeHtml(group.name || '移动目标')}</div>
-        ${group.folders.map(folder => `
+        ${getOrderedGroupFolders(group, 'move').map(folder => `
             <button class="move-target-menu-item" type="button" data-folder-id="${escapeHtml(folder.id)}">
                 <span class="move-target-menu-name">${escapeHtml(folder.name || getFolderName(folder.path))}</span>
                 <span class="move-target-menu-path">${escapeHtml(folder.path)}</span>
@@ -2924,6 +3584,7 @@ function removeCurrentVideoFromPlaylist(message) {
 }
 
 function setPlayerActionBusy(busy) {
+    state.fileActionBusy = busy;
     [elements.deleteCurrentVideo, ...document.querySelectorAll('.move-target-action')].forEach(button => {
         if (button) button.disabled = busy;
     });
@@ -2937,11 +3598,18 @@ async function deleteCurrentVideoToRecycleBin() {
         return;
     }
 
-    if (!window.confirm(`确定将“${video.name}”移动到回收站吗？`)) return;
+    const requestId = desktopState.navigationRequest;
+    if (!await showAppDialog({ title: '移入回收站', message: `将“${video.name}”移入回收站？`, detail: '完成后会切换到下一个视频，需要时可从 Windows 回收站恢复。', confirm: true, confirmText: '移入回收站', danger: true })) return;
+    if (state.playlist[state.currentIndex] !== video || desktopState.navigationRequest !== requestId) {
+        showToast('当前视频已切换，请重新确认需要删除的视频');
+        return;
+    }
 
     setPlayerActionBusy(true);
     try {
         await invokeDesktop('send_to_recycle_bin', { path: video.path });
+        leavePlaybackSession();
+        playbackMemory.remove(videoIdentity(video));
         removeCurrentVideoFromPlaylist('已移入回收站，已切换到下一个视频');
     } catch (error) {
         console.error('删除视频失败:', error);
@@ -2966,10 +3634,14 @@ async function moveCurrentVideoToFolder(folder = null) {
 
     setPlayerActionBusy(true);
     try {
-        await invokeDesktop('move_file_to_folder', {
+        await captureDesktopSession(playbackSession.active);
+        const movedPath = await invokeDesktop('move_file_to_folder', {
             path: video.path,
             destinationDir: folder.path
         });
+        leavePlaybackSession();
+        const movedMetadata = await invokeDesktop('playback_file_metadata', { path: movedPath }).catch(() => video);
+        playbackMemory.move(videoIdentity(video), videoIdentity({ ...video, path: movedPath }), video, movedMetadata);
         removeCurrentVideoFromPlaylist(`已移动到“${folder.name || getFolderName(folder.path)}”，已切换到下一个视频`);
     } catch (error) {
         console.error('移动视频失败:', error);
@@ -2990,12 +3662,17 @@ function updateLoopState() {
 
     const videos = elements.videoContainer.querySelectorAll('video');
     videos.forEach(video => {
-        video.loop = state.options.loopSingle;
+        video.loop = playbackSession.active?.element === video && playbackSession.active.segmentMode ? false : state.options.loopSingle;
     });
 }
 
 // 播放/暂停
 function togglePlay() {
+    const session = playbackSession.active;
+    if (session?.segmentMode === 'once' && session.segmentFinished) {
+        queueSegmentAction(active => startSegment(active, false));
+        return;
+    }
     const currentVideo = getCurrentVideo();
     if (currentVideo) {
         if (currentVideo.paused) {
@@ -3008,15 +3685,8 @@ function togglePlay() {
 
 // 播放/暂停按钮点击处理
 function togglePlayPause() {
-    const currentVideo = getCurrentVideo();
-    if (currentVideo) {
-        if (currentVideo.paused) {
-            currentVideo.play();
-        } else {
-            currentVideo.pause();
-        }
-        updatePlayPauseButton();
-    }
+    togglePlay();
+    updatePlayPauseButton();
 }
 
 // 更新播放/暂停按钮图标
@@ -3082,6 +3752,7 @@ function getCurrentVideo() {
 
 // 跳转到指定视频
 function jumpToVideo(index) {
+    if (state.fileActionBusy) return;
     if (index < 0 || index >= state.playlist.length) return;
 
     if (isDesktopApp) {
@@ -3120,12 +3791,19 @@ function showPlayer() {
 }
 
 // 返回首页
-function goHome() {
+async function goHome() {
+    if (state.fileActionBusy) return;
+    const outgoing = leavePlaybackSession();
+    const exitGeneration = playbackSession.generation;
+    desktopState.navigationRequest += 1;
+    await captureDesktopSession(outgoing);
+    if (playbackSession.generation !== exitGeneration) return;
+    saveSession(outgoing, true);
+    seekPreview.reset();
     // 暂停并释放所有视频
     const videos = elements.videoContainer.querySelectorAll('video');
     videos.forEach(video => {
-        video.pause();
-        video.src = ''; // 释放内存
+        releaseBrowserVideo(video);
     });
 
     if (isDesktopApp && desktopState.started) {
@@ -3134,7 +3812,7 @@ function goHome() {
             invokeDesktop('set_fullscreen', { fullscreen: false }).catch(() => {});
             desktopState.fullscreen = false;
         }
-        invokeDesktop('plugin:libmpv|destroy', { windowLabel: MPV_WINDOW_LABEL })
+        desktopState.destroyPromise = desktopState.navigationChain.catch(() => {}).then(() => invokeDesktop('plugin:libmpv|destroy', { windowLabel: MPV_WINDOW_LABEL }))
             .catch(error => console.debug('停止 libmpv 失败:', error));
         desktopState.started = false;
         desktopState.mode = 'idle';
@@ -3183,7 +3861,7 @@ function formatFileSize(bytes) {
 
 // 更新进度条
 function updateProgress(video) {
-    if (!video.duration) return;
+    if (!Number.isFinite(video.duration) || video.duration <= 0) return;
 
     const percent = (video.currentTime / video.duration) * 100;
     elements.progressBar.style.width = percent + '%';
@@ -3194,10 +3872,11 @@ function updateProgress(video) {
 // 处理进度条点击
 function handleProgressClick(e) {
     const currentVideo = getCurrentVideo();
-    if (!currentVideo || !currentVideo.duration) return;
+    if (!currentVideo || !Number.isFinite(currentVideo.duration) || currentVideo.duration <= 0) return;
 
     const rect = elements.progressWrapper.getBoundingClientRect();
-    const percent = (e.clientX - rect.left) / rect.width;
+    if (rect.width <= 0) return;
+    const percent = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     currentVideo.currentTime = percent * currentVideo.duration;
 }
 
@@ -3211,6 +3890,8 @@ function formatTime(seconds) {
 
 // 键盘快捷键
 function handleKeyboard(e) {
+    if (e.target?.closest('input, textarea, select, [contenteditable="true"], .segment-control')) return;
+    if (document.getElementById('app-dialog')?.open) return;
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
 
     // 调试：检测所有键盘事件

@@ -8,7 +8,7 @@ $backgroundTarget = Join-Path $frontendRoot 'BackGroudPics'
 New-Item -ItemType Directory -Force -Path $frontendRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $backgroundTarget | Out-Null
 
-foreach ($fileName in @('index.html', 'script.js', 'style.css', 'backgrounds.js')) {
+foreach ($fileName in @('index.html', 'script.js', 'seek-preview.js', 'playback-memory.js', 'style.css', 'backgrounds.js')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $fileName) -Destination (Join-Path $frontendRoot $fileName) -Force
 }
 
